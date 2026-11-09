@@ -114,13 +114,13 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
  useEffect(()=>{
   const socket=socketRef.current;
   if(!socket?.connected || status!=='online'||!location||!fresh(location.timestamp))return;
-  if(location.accuracyMeters===null||location.accuracyMeters>150)return;
+  if(location.accuracyMeters===null||location.accuracyMeters>2500)return;
   if(location.timestamp<=lastSentRef.current)return;
   lastSentRef.current=location.timestamp;
   socket.timeout(5000).emit('telemetry:update',{
    latitude:location.latitude,longitude:location.longitude,
    speedKmh:location.speedKmh,heading:location.heading,
-   accuracyMeters:location.accuracyMeters,timestamp:location.timestamp,route,
+   accuracyMeters:location.accuracyMeters,timestamp:Date.now(),route,
   },(timeout:Error|null,result?:TelemetryAck)=>{
    if(timeout){setLastUploadError('GPS upload timeout');return;}
    if(!result?.ok){setLastUploadError(result?.error??'GPS update rejected');return;}

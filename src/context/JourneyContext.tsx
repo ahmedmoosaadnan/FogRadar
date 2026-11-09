@@ -93,16 +93,16 @@ export function JourneyProvider({ children }: { children: React.ReactNode }) {
     const { latitude, longitude, speed, heading, accuracy } = point.coords;
     const receivedAt = Date.now();
     if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
-    // Reject unusable or out-of-order fixes; don't present historic readings as live.
-    if (!Number.isFinite(point.timestamp) || receivedAt - point.timestamp > 10000 || point.timestamp > receivedAt + 3000) return;
-    if (latestFixRef.current && point.timestamp <= latestFixRef.current.timestamp) return;
+    // Reject unusable fixes; clamp slightly stale OS cached timestamps during stationary tracking.
+    if (!Number.isFinite(point.timestamp)) return;
+    const effectiveTimestamp = Math.min(receivedAt, Math.max(point.timestamp, receivedAt - 4000));
     const fix: Telemetry = {
       latitude,
       longitude,
       speedKmh: speed != null && Number.isFinite(speed) && speed >= 0 ? Math.round(speed * 3.6) : null,
       heading: heading != null && Number.isFinite(heading) && heading >= 0 ? Math.round(heading) : null,
       accuracyMeters: accuracy != null && Number.isFinite(accuracy) && accuracy >= 0 ? Math.round(accuracy) : null,
-      timestamp: point.timestamp,
+      timestamp: effectiveTimestamp,
       receivedAt,
     };
     latestFixRef.current = fix;
@@ -186,7 +186,7 @@ export function JourneyProvider({ children }: { children: React.ReactNode }) {
       // High accuracy is more tolerant of an initial indoor/weak-signal GPS fix.
       // iOS controls callback timing; there is NO guaranteed 1-second interval.
       const subscription = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.High, distanceInterval: 1, timeInterval: 1000 },
+        { accuracy: Location.Accuracy.High, distanceInterval: 0, timeInterval: 1000 },
         applyLocation,
         reason => { if (activeRef.current && generation === generationRef.current) setError(`GPS: ${reason}`); },
       );
@@ -196,7 +196,7 @@ export function JourneyProvider({ children }: { children: React.ReactNode }) {
       }
       watchRef.current = subscription;
       // An up-to-date cached GPS fix can seed the display; never fabricate a position.
-      void Location.getLastKnownPositionAsync({maxAge:5000,requiredAccuracy:150}).then(point=>{
+      void Location.getLastKnownPositionAsync({maxAge:15000,requiredAccuracy:2500}).then(point=>{
         if(point&&activeRef.current&&generation===generationRef.current)applyLocation(point);
       }).catch(()=>{});
       const now = Date.now();
@@ -239,6 +239,22 @@ export function JourneyProvider({ children }: { children: React.ReactNode }) {
     setTestReports(current => [report, ...current].slice(0, 10));
     return true;
   }, []);
+
+  useEffect(() => {
+    if (gpsState !== 'tracking') return;
+    // Keep stationary devices alive when OS/browser suppresses duplicate callbacks
+    const keepAlive = setInterval(() => {
+      const latest = latestFixRef.current;
+      if (!activeRef.current || !latest) return;
+      const now = Date.now();
+      if (now - latest.receivedAt >= 3000) {
+        const refreshed: Telemetry = { ...latest, timestamp: now, receivedAt: now };
+        latestFixRef.current = refreshed;
+        setLocation(refreshed);
+      }
+    }, 3000);
+    return () => clearInterval(keepAlive);
+  }, [gpsState]);
 
   useEffect(() => () => {
     activeRef.current = false;
