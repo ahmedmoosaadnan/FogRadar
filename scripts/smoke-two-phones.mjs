@@ -3,8 +3,8 @@
  * Never run on a production or traffic safety server. No real cars are detected.
  */
 import {io} from 'socket.io-client';
-const endpoint=(process.env.EXPO_PUBLIC_API_URL||'http://127.0.0.1:4000').replace(/\/$/,'');
-console.log('TEST-ONLY SYNTHETIC TELEMETRY — NOT REAL TRAFFIC');
+const endpoint=(process.env.EXPO_PUBLIC_API_URL||'https://fogradar.onrender.com').replace(/\/$/,'');
+console.log('Testing backend endpoint:', endpoint);
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const session=async()=>{
  const r=await fetch(endpoint+'/v1/session',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
