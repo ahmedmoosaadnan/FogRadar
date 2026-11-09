@@ -7,6 +7,7 @@ import pg from 'pg';
 import {randomUUID} from 'node:crypto';
 import {bearingDegrees,headingDelta,isAhead,metersBetween} from './geo.js';
 import {issueToken,verifyToken} from './security.js';
+import {buildDeterministicInsights,normalizeRouteParam,requestLlmInsights,type InsightsResponse} from './insights.js';
 
 const secret=(process.env.TOKEN_SECRET||process.env.SESSION_SECRET)??'';
 if(secret.length<32 || secret.startsWith('CHANGE_ME'))throw new Error('Set a random 32+ character TOKEN_SECRET (or SESSION_SECRET) environment variable');
@@ -39,7 +40,51 @@ const GEO_KEY='fog:live:geo',ACTIVE_KEY='fog:live:active';
 type Fix={latitude:number;longitude:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;timestamp:number;route:string;seenAt:number};
 type AuthedSocket=Socket & {data:{vehicleId:string;lastReportAt?:number}};
 const sessionLimit=new Map<string,{count:number;until:number}>();
+const insightsCache=new Map<string,InsightsResponse>();
 app.get('/health',async()=>({ok:true,service:'FogRadar MVP',phase:'FIELD-TEST-ONLY',time:Date.now()}));
+app.get('/v1/insights',async(req)=>{
+ const query=(req.query&&typeof req.query==='object'?req.query:{}) as {route?:unknown};
+ const route=normalizeRouteParam(query.route);
+ const now=Date.now();
+ const cached=insightsCache.get(route);
+ if(cached && now-cached.generatedAt<60_000)return cached;
+ try{
+  const [dbRes,activeIds]=await Promise.all([
+   pool.query<{type:string;latitude:number;longitude:number;report_count:number;created_at:Date}>(
+    `SELECT type,latitude,longitude,report_count,created_at FROM hazards
+     WHERE route=$1 AND status='corroborated' AND expires_at>NOW()
+     ORDER BY created_at DESC LIMIT 20`,
+    [route]
+   ),
+   redis.zRangeByScore(ACTIVE_KEY,now-12_000,'+inf',{LIMIT:{offset:0,count:200}}),
+  ]);
+  let liveVehicles=0;
+  if(activeIds.length){
+   const records=await redis.mGet(activeIds.map(id=>`fog:live:vehicle:${id}`));
+   for(const raw of records){
+    if(!raw)continue;
+    try{
+     const fix=JSON.parse(raw) as Fix;
+     if(now-fix.seenAt<=12_000 && fix.route===route)liveVehicles+=1;
+    }catch{ /* ignore malformed ephemeral entries */ }
+   }
+  }
+  const hazards=dbRes.rows.map(r=>({
+   type:r.type,
+   latitude:Number(r.latitude),
+   longitude:Number(r.longitude),
+   ageMinutes:Math.max(1,Math.round((now-new Date(r.created_at).getTime())/60_000)),
+   reportCount:Number(r.report_count),
+  }));
+  const result=await requestLlmInsights({route,liveVehicles,hazards},process.env.LLM_API_KEY,process.env.LLM_MODEL,now);
+  insightsCache.set(route,result);
+  return result;
+ }catch(e){
+  app.log.warn(e,'Insights generation fell back to deterministic template');
+  const fallback=buildDeterministicInsights({route,liveVehicles:0,hazards:[]},now);
+  return fallback;
+ }
+});
 app.post('/v1/session',async(req,reply)=>{
  const ip=req.ip,now=Date.now(),entry=sessionLimit.get(ip);
  if(entry&&entry.until>now&&entry.count>=15)return reply.code(429).send({error:'Too many sessions. Try later.'});
