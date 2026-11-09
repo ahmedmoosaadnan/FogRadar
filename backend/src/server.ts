@@ -135,12 +135,11 @@ async function nearby(id:string,own:Fix){
 }
 type HazardRow={id:string;type:string;route:string;latitude:number;longitude:number;heading:number;report_count:number;expires_at:Date};
 async function hazardsAhead(own:Fix){
- if(own.heading===null)return [];
  const rows=await pool.query<HazardRow>(`SELECT id,type,route,latitude,longitude,heading,report_count,expires_at
  FROM hazards WHERE route=$1 AND status='corroborated' AND expires_at>NOW()
  AND ST_DWithin(position,ST_SetSRID(ST_MakePoint($2,$3),4326)::geography,1000)
  ORDER BY created_at DESC LIMIT 30`,[own.route,own.longitude,own.latitude]);
- return rows.rows.filter(v=>isAhead({...own,heading:own.heading!},v)).map(v=>({
+ return rows.rows.filter(v=>own.heading===null?true:isAhead({...own,heading:own.heading},v)).map(v=>({
    id:v.id,type:v.type,distanceMeters:Math.round(metersBetween(own,v)),reportCount:v.report_count,
    expiresAt:new Date(v.expires_at).getTime(),status:'corroborated-experimental' as const,
  })).sort((a,b)=>a.distanceMeters-b.distanceMeters);
@@ -156,7 +155,8 @@ async function reportHazard(socket:AuthedSocket,body:unknown){
  if(!body||typeof body!=='object'||!hazardTypes.has((body as {type?:string}).type??''))throw Error('Invalid hazard type');
  const type=(body as {type:string}).type;
  const current=await getFix(socket.data.vehicleId);
- if(!current || current.heading===null || current.accuracyMeters>35 || Date.now()-current.timestamp>6_000)throw Error('Recent, precise GPS and heading required');
+ if(!current || current.accuracyMeters>2500 || Date.now()-current.timestamp>15_000)throw Error('Recent GPS fix required');
+ const heading=current.heading??0;
  if(socket.data.lastReportAt && Date.now()-socket.data.lastReportAt<60_000)throw Error('Please wait before reporting again');
  // Single-person reports are never sent as critical warnings. A second distinct trip is necessary.
  const client=await pool.connect();
@@ -168,7 +168,7 @@ async function reportHazard(socket:AuthedSocket,body:unknown){
     WHERE h.route=$1 AND h.type=$2 AND h.expires_at>NOW()
       AND ABS(MOD((h.heading-$3+540)::numeric,360)-180)<45
       AND ST_DWithin(h.position,ST_SetSRID(ST_MakePoint($4,$5),4326)::geography,150)
-    ORDER BY h.created_at DESC LIMIT 1`,[current.route,type,current.heading,current.longitude,current.latitude]);
+    ORDER BY h.created_at DESC LIMIT 1`,[current.route,type,heading,current.longitude,current.latitude]);
   if(existing.rows.length){
    const id=existing.rows[0].id;
    const inserted=await client.query(`INSERT INTO hazard_reports(hazard_id,reporter_id) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING hazard_id`,[id,socket.data.vehicleId]);
@@ -180,7 +180,7 @@ async function reportHazard(socket:AuthedSocket,body:unknown){
   }else{
    const id=randomUUID(),ttl=type==='Stopped traffic'?8:15;
    await client.query(`INSERT INTO hazards(id,type,route,heading,position,latitude,longitude,expires_at)
-    VALUES($1,$2,$3,$4,ST_SetSRID(ST_MakePoint($5,$6),4326)::geography,$6,$5,NOW()+($7::int*INTERVAL '1 minute'))`,[id,type,current.route,current.heading,current.longitude,current.latitude,ttl]);
+    VALUES($1,$2,$3,$4,ST_SetSRID(ST_MakePoint($5,$6),4326)::geography,$6,$5,NOW()+($7::int*INTERVAL '1 minute'))`,[id,type,current.route,heading,current.longitude,current.latitude,ttl]);
    await client.query('INSERT INTO hazard_reports(hazard_id,reporter_id) VALUES($1,$2)',[id,socket.data.vehicleId]);
    outcome={id,reportCount:1,status:'candidate'};
   }

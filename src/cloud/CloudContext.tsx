@@ -131,7 +131,7 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
  const reportHazard=useCallback(async(type:HazardType):Promise<HazardAck>=>{
   const socket=socketRef.current;
   if(!socket?.connected)return {ok:false,error:'Cloud offline: report NOT sent'};
-  if(!location||!fresh(location.timestamp)||location.accuracyMeters===null||location.accuracyMeters>35||location.heading===null)return {ok:false,error:'Fresh GPS (±35 m or better) and motion heading needed'};
+  if(!location||!fresh(location.timestamp)||location.accuracyMeters===null||location.accuracyMeters>2500)return {ok:false,error:'Fresh GPS fix needed'};
   return new Promise(resolve=>socket.timeout(8000).emit('hazard:report',{type},(e:Error|null,result?:HazardAck)=>{
    resolve(e?{ok:false,error:'Server timeout; status unknown, do not immediately retry'}:result??{ok:false,error:'No response'});
   }));
