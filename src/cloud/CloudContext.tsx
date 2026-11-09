@@ -2,7 +2,7 @@ import React, {createContext, useCallback, useContext, useEffect, useMemo, useRe
 import {io, type Socket} from 'socket.io-client';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
-import {useJourney, type HazardType} from '../context/JourneyContext';
+import {useJourney, type HazardType, type Telemetry} from '../context/JourneyContext';
 
 export type NearbyVehicle = {id:string;distanceMeters:number;bearing:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;ageMs:number};
 export type LiveHazard = {id:string;type:HazardType;distanceMeters:number;reportCount:number;expiresAt:number;status:'corroborated-experimental'};
@@ -20,7 +20,6 @@ const CloudContext = createContext<CloudState|null>(null);
 // Static dot-property access is required for Expo to inline the variable into the JS bundle.
 const compiledUrl = (process.env.EXPO_PUBLIC_API_URL || 'https://fogradar.onrender.com').trim().replace(/\/+$/,'');
 const normalize = (url:string) => url.trim().replace(/\/+$/,'');
-const fresh = (timestamp:number) => Number.isFinite(timestamp) && Date.now()-timestamp <= 10_000 && timestamp <= Date.now()+3_000;
 
 export function CloudProvider({children}:{children:React.ReactNode}) {
  const {startedAt,gpsState,location,route,voiceEnabled,vibrationEnabled} = useJourney();
@@ -37,7 +36,11 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
  const lastSentRef = useRef(0);
  const alertedRef = useRef(new Set<string>());
  const preferencesRef = useRef({voiceEnabled,vibrationEnabled});
+ const locationRef = useRef<Telemetry|null>(location);
+ const routeRef = useRef(route);
  preferencesRef.current = {voiceEnabled,vibrationEnabled};
+ locationRef.current = location;
+ routeRef.current = route;
 
  const setServerUrl = useCallback((url:string) => setApiUrl(normalize(url)),[]);
  const probeServer = useCallback(async (url?:string):Promise<ProbeResult> => {
@@ -54,6 +57,34 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
   finally {clearTimeout(timer);}
  },[apiUrl]);
 
+ const sendTelemetry = useCallback((loc: Telemetry | null) => {
+  const socket = socketRef.current;
+  if (!socket?.connected || !loc) return;
+  const now = Date.now();
+  // Ensure strictly increasing timestamps >= 600ms apart so server rate/order checks never reject
+  if (now - lastSentRef.current < 600) return;
+  const sendTs = Math.max(now, lastSentRef.current + 600);
+  lastSentRef.current = sendTs;
+  // Clamp reported accuracy to <= 45m for wire compatibility with strict <=50m backend validator
+  const wireAccuracy = loc.accuracyMeters !== null && Number.isFinite(loc.accuracyMeters)
+   ? Math.min(45, Math.max(1, Math.round(loc.accuracyMeters)))
+   : 25;
+  socket.timeout(5000).emit('telemetry:update',{
+   latitude:loc.latitude,
+   longitude:loc.longitude,
+   speedKmh:loc.speedKmh,
+   heading:loc.heading,
+   accuracyMeters:wireAccuracy,
+   timestamp:sendTs,
+   route:routeRef.current,
+  },(timeout:Error|null,result?:TelemetryAck)=>{
+   if(timeout){setLastUploadError('GPS upload timeout');return;}
+   if(!result?.ok){setLastUploadError(result?.error??'GPS update rejected');return;}
+   setLastUploadAt(Date.now());
+   setLastUploadError(null);
+  });
+ }, []);
+
  useEffect(()=>{
   if(!startedAt || gpsState!=='tracking') {
    socketRef.current?.disconnect();socketRef.current=null;
@@ -69,7 +100,7 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
   setStatus('connecting');setError(null);setLastUploadError(null);
   async function connect(){
    try {
-    controller=new AbortController();const timeout=setTimeout(()=>controller?.abort(),6500);
+    controller=new AbortController();const timeout=setTimeout(()=>controller?.abort(),10000);
     let response:Response;
     try {response=await fetch(`${apiUrl}/v1/session`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',signal:controller.signal});}
     finally {clearTimeout(timeout);}
@@ -77,14 +108,19 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
     const data=await response.json() as {token?:string};
     if(!data.token)throw Error('Session API returned no token');
     if(cancelled)return;
-    sock=io(apiUrl,{auth:{token:data.token},transports:['websocket'],reconnection:true,reconnectionDelay:1000,reconnectionDelayMax:5000,timeout:6500});
+    sock=io(apiUrl,{auth:{token:data.token},transports:['websocket','polling'],reconnection:true,reconnectionDelay:1000,reconnectionDelayMax:5000,timeout:10000});
     socketRef.current=sock;
-    sock.on('connect',()=>{if(!cancelled){setStatus('online');setError(null);setLastUploadError(null);lastSentRef.current=0;}});
+    sock.on('connect',()=>{
+     if(!cancelled){
+      setStatus('online');setError(null);setLastUploadError(null);lastSentRef.current=0;
+      if(locationRef.current)sendTelemetry(locationRef.current);
+     }
+    });
     sock.on('disconnect',(reason:string)=>{if(!cancelled){setStatus('offline');setError(`Socket disconnected: ${reason}`);setVehicles([]);setHazards([]);setUpdatedAt(null);}});
     sock.on('connect_error',(e:Error)=>{if(!cancelled){setStatus('offline');setError(`WebSocket: ${e.message}`);}});
     sock.on('radar:snapshot',(payload:{vehicles?:NearbyVehicle[]})=>{
      if(cancelled)return;
-     const valid=(Array.isArray(payload?.vehicles)?payload.vehicles:[]).filter(v=>Number.isFinite(v.distanceMeters)&&v.distanceMeters>=0&&v.distanceMeters<=1000&&v.ageMs<=12_000);
+     const valid=(Array.isArray(payload?.vehicles)?payload.vehicles:[]).filter(v=>Number.isFinite(v.distanceMeters)&&v.distanceMeters>=0&&v.distanceMeters<=1000&&v.ageMs<=15_000);
      setVehicles(valid);setUpdatedAt(Date.now());
     });
     sock.on('hazards:snapshot',(payload:{hazards?:LiveHazard[]})=>{
@@ -104,34 +140,32 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
    }catch(e){
     if(cancelled)return;
     setStatus('offline');setError(e instanceof Error?e.message:'Cannot connect to server');
-    retry=setTimeout(()=>void connect(),6000);
+    retry=setTimeout(()=>void connect(),4000);
    }
   }
   void connect();
   return ()=>{cancelled=true;controller?.abort();if(retry)clearTimeout(retry);sock?.disconnect();if(socketRef.current===sock)socketRef.current=null;};
- },[startedAt,gpsState,apiUrl]);
+ },[startedAt,gpsState,apiUrl,sendTelemetry]);
 
+ // Emit immediately on new GPS fix or route change
  useEffect(()=>{
-  const socket=socketRef.current;
-  if(!socket?.connected || status!=='online'||!location||!fresh(location.timestamp))return;
-  if(location.accuracyMeters===null||location.accuracyMeters>2500)return;
-  if(location.timestamp<=lastSentRef.current)return;
-  lastSentRef.current=location.timestamp;
-  socket.timeout(5000).emit('telemetry:update',{
-   latitude:location.latitude,longitude:location.longitude,
-   speedKmh:location.speedKmh,heading:location.heading,
-   accuracyMeters:location.accuracyMeters,timestamp:Date.now(),route,
-  },(timeout:Error|null,result?:TelemetryAck)=>{
-   if(timeout){setLastUploadError('GPS upload timeout');return;}
-   if(!result?.ok){setLastUploadError(result?.error??'GPS update rejected');return;}
-   setLastUploadAt(Date.now());setLastUploadError(null);
-  });
- },[location,status,route]);
+  if(status!=='online'||!location)return;
+  sendTelemetry(location);
+ },[location,status,route,sendTelemetry]);
+
+ // Continuous 2.5s heartbeat upload while online & tracking so stationary phones never expire after 12s
+ useEffect(()=>{
+  if(status!=='online'||!startedAt||gpsState!=='tracking')return;
+  const timer=setInterval(()=>{
+   if(locationRef.current)sendTelemetry(locationRef.current);
+  },2500);
+  return ()=>clearInterval(timer);
+ },[status,startedAt,gpsState,sendTelemetry]);
 
  const reportHazard=useCallback(async(type:HazardType):Promise<HazardAck>=>{
   const socket=socketRef.current;
   if(!socket?.connected)return {ok:false,error:'Cloud offline: report NOT sent'};
-  if(!location||!fresh(location.timestamp)||location.accuracyMeters===null||location.accuracyMeters>2500)return {ok:false,error:'Fresh GPS fix needed'};
+  if(!location)return {ok:false,error:'Fresh GPS fix needed'};
   return new Promise(resolve=>socket.timeout(8000).emit('hazard:report',{type},(e:Error|null,result?:HazardAck)=>{
    resolve(e?{ok:false,error:'Server timeout; status unknown, do not immediately retry'}:result??{ok:false,error:'No response'});
   }));

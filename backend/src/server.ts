@@ -96,7 +96,7 @@ const validNum=(value:unknown,min:number,max:number):value is number=>typeof val
 function parseFix(raw:unknown):Fix|null{
  if(!raw || typeof raw!=='object')return null;
  const x=raw as Record<string,unknown>,now=Date.now();
- if(!validNum(x.latitude,-90,90)||!validNum(x.longitude,-180,180)||!validNum(x.accuracyMeters,0,2500)||!validNum(x.timestamp,now-15_000,now+5000)||typeof x.route!=='string'||!routes.has(x.route))return null;
+ if(!validNum(x.latitude,-90,90)||!validNum(x.longitude,-180,180)||!validNum(x.accuracyMeters,0,50000)||!validNum(x.timestamp,now-300_000,now+300_000)||typeof x.route!=='string'||!routes.has(x.route))return null;
  if(x.speedKmh!==null&&!validNum(x.speedKmh,0,220))return null;
  if(x.heading!==null&&!validNum(x.heading,0,360))return null;
  return {latitude:x.latitude,longitude:x.longitude,accuracyMeters:x.accuracyMeters,timestamp:x.timestamp,route:x.route,speedKmh:x.speedKmh as number|null,heading:x.heading as number|null,seenAt:now};

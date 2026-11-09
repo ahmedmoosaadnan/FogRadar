@@ -15,9 +15,9 @@ export default function Radar(){
  const [clock,setClock]=useState(Date.now());
  useEffect(()=>{const timer=setInterval(()=>setClock(Date.now()),500);return()=>clearInterval(timer);},[]);
  const fixAge=location?Math.max(0,clock-location.timestamp):null;
- const freshFix=gpsState==='tracking'&&location!==null&&fixAge!==null&&fixAge<=5000;
+ const freshFix=gpsState==='tracking'&&location!==null&&fixAge!==null&&fixAge<=15000;
  const feedAge=updatedAt?Math.max(0,clock-updatedAt):null;
- const freshFeed=status==='online'&&updatedAt!==null&&feedAge!==null&&feedAge<=6000&&freshFix;
+ const freshFeed=status==='online'&&updatedAt!==null&&feedAge!==null&&feedAge<=15000&&freshFix;
  const liveVehicles=freshFeed?vehicles:[];
  const ownAccuracy=freshFix?location?.accuracyMeters??null:null;
  return <SafeAreaView style={s.safe} edges={['top']}><StatusBar style="light"/><ScrollView contentContainerStyle={s.body}>
