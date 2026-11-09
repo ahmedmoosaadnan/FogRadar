@@ -110,11 +110,11 @@ export function JourneyProvider({ children }: { children: React.ReactNode }) {
     setError(null); // A fresh valid fix clears a transient Core Location error.
     samplesRef.current += 1;
     setGpsSamples(samplesRef.current);
-    if (fix.speedKmh !== null && fix.accuracyMeters !== null && fix.accuracyMeters <= 50) {
+    if (fix.speedKmh !== null && fix.accuracyMeters !== null && fix.accuracyMeters <= 150) {
       maxSpeedRef.current = Math.max(maxSpeedRef.current ?? 0, fix.speedKmh);
     }
     const previous = lastFixRef.current;
-    if (previous && previous.accuracyMeters !== null && previous.accuracyMeters <= 50 && fix.accuracyMeters !== null && fix.accuracyMeters <= 50) {
+    if (previous && previous.accuracyMeters !== null && previous.accuracyMeters <= 150 && fix.accuracyMeters !== null && fix.accuracyMeters <= 150) {
       const seconds = (fix.timestamp - previous.timestamp) / 1000;
       const meters = metersBetween(previous, fix);
       const moving = (fix.speedKmh ?? 0) >= 7 || (previous.speedKmh ?? 0) >= 7;
@@ -128,7 +128,7 @@ export function JourneyProvider({ children }: { children: React.ReactNode }) {
         }
         lastFixRef.current = fix;
       }
-    } else if (fix.accuracyMeters !== null && fix.accuracyMeters <= 50) {
+    } else if (fix.accuracyMeters !== null && fix.accuracyMeters <= 150) {
       lastFixRef.current = fix;
     }
   }, []);
@@ -196,7 +196,7 @@ export function JourneyProvider({ children }: { children: React.ReactNode }) {
       }
       watchRef.current = subscription;
       // An up-to-date cached GPS fix can seed the display; never fabricate a position.
-      void Location.getLastKnownPositionAsync({maxAge:5000,requiredAccuracy:50}).then(point=>{
+      void Location.getLastKnownPositionAsync({maxAge:5000,requiredAccuracy:150}).then(point=>{
         if(point&&activeRef.current&&generation===generationRef.current)applyLocation(point);
       }).catch(()=>{});
       const now = Date.now();

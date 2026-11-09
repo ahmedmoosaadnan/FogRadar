@@ -18,7 +18,7 @@ type CloudState = {
 };
 const CloudContext = createContext<CloudState|null>(null);
 // Static dot-property access is required for Expo to inline the variable into the JS bundle.
-const compiledUrl = (process.env.EXPO_PUBLIC_API_URL ?? '').trim().replace(/\/+$/,'');
+const compiledUrl = (process.env.EXPO_PUBLIC_API_URL || 'https://fogradar.onrender.com').trim().replace(/\/+$/,'');
 const normalize = (url:string) => url.trim().replace(/\/+$/,'');
 const fresh = (timestamp:number) => Number.isFinite(timestamp) && Date.now()-timestamp <= 10_000 && timestamp <= Date.now()+3_000;
 
@@ -114,7 +114,7 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
  useEffect(()=>{
   const socket=socketRef.current;
   if(!socket?.connected || status!=='online'||!location||!fresh(location.timestamp))return;
-  if(location.accuracyMeters===null||location.accuracyMeters>50)return;
+  if(location.accuracyMeters===null||location.accuracyMeters>150)return;
   if(location.timestamp<=lastSentRef.current)return;
   lastSentRef.current=location.timestamp;
   socket.timeout(5000).emit('telemetry:update',{
