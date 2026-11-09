@@ -1,0 +1,49 @@
+{
+  "expo": {
+    "name": "FogRadar",
+    "slug": "fogradar",
+    "scheme": "fogradar",
+    "version": "0.5.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "icon": "./assets/icon.png",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.fogradar.mobile",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "FogRadar uses your precise location during an active test journey to show your speed and nearby connected test phones through your chosen FogRadar server. Other traffic is not detected."
+      }
+    },
+    "android": {
+      "package": "com.fogradar.mobile",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#06472D"
+      }
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow FogRadar to use precise location during an active test journey to send GPS data to the FogRadar server and show connected test phones nearby.",
+          "isIosBackgroundLocationEnabled": false,
+          "isAndroidBackgroundLocationEnabled": false,
+          "isAndroidForegroundServiceEnabled": false
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/icon.png",
+          "imageWidth": 180,
+          "resizeMode": "contain",
+          "backgroundColor": "#06472D"
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": false
+    }
+  }
+}

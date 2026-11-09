@@ -1,0 +1,37 @@
+FogRadar React Native v0.3 — Functional Journey + Local Test Reports
+
+CHANGED / NEW:
+- src/context/JourneyContext.tsx: foreground GPS watcher, session lifecycle, trip metrics, local-only report drafts.
+- src/hooks/useGpsHealth.ts: 5-second freshness threshold, fixes and callback latency diagnostics.
+- src/hooks/useTripStats.ts: elapsed trip time formatter.
+- app/(tabs)/home.tsx: journey metrics, end trip -> summary, report route.
+- app/(tabs)/alerts.tsx: local-only drafts, clear action, report link.
+- app/(tabs)/settings.tsx: version text.
+- app/gps-diagnostics.tsx: GPS latency, callback age, session metrics.
+- app/trip-summary.tsx: local journey summary (new).
+- app/report-hazard.tsx: local TEST reporting screen (new).
+- app/_layout.tsx: register new routes.
+
+INSTALL PATCH:
+1. Make a Git commit / copy of your working E:\FogRadar project.
+2. Unzip and copy just the app/ and src/ directories into E:\FogRadar, merging by path and replacing same-name files.
+3. DO NOT copy V03_NOTES.txt unless you want it; DO NOT replace package.json, app.json, node_modules, lockfile or assets.
+4. npm run typecheck
+5. npx expo-doctor
+6. npx expo start -c
+
+TEST:
+- Begin journey. Confirm GPS updates and speed (only actual GPS values).
+- Open GPS Diagnostics and observe `GPS fix -> JS callback latency` and `Time since callback` while safely moving as a passenger.
+- Observe timer, approximate distance, sample count on Home.
+- End journey. Confirm summary and no more GPS updates.
+- Start another trip; metrics must reset.
+- Create test report with fresh GPS; check Alerts tab shows LOCAL ONLY. Clear test reports.
+- Restart app; reports and trip summary are intentionally not persisted.
+
+IMPORTANT:
+- iOS controls actual GPS callback frequency. timeInterval is Android-only; 1 m distanceInterval and BestForNavigation request frequent updates but are not a guarantee. Battery usage can increase.
+- GPS trip distance is approximate, deliberately filters out some short/poor fixes and can underestimate distance.
+- No background tracking, no cloud backend, no genuine nearby vehicle detection, and NO live hazard reporting/alert service.
+- This is not a safety system. Do not use the prototype while driving; test as a passenger or in controlled environments.
+- This patch has been TypeScript syntax-parsed but full npm-based typechecking and runtime verification could not be completed in this environment. Check on your machine.

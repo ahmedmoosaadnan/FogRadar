@@ -1,0 +1,27 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    ports: ["127.0.0.1:6379:6379"]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  db:
+    image: postgis/postgis:16-3.5
+    environment:
+      POSTGRES_USER: fogradar
+      POSTGRES_PASSWORD: fogradar_dev_only
+      POSTGRES_DB: fogradar
+    ports: ["127.0.0.1:5432:5432"]
+    volumes:
+      - fogradar_pg:/var/lib/postgresql/data
+      - ./sql/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fogradar"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  fogradar_pg:
