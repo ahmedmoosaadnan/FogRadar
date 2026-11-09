@@ -48,10 +48,18 @@ export function normalizeRouteParam(raw: unknown): string {
 
 export function buildDeterministicInsights(data: RouteInsightsData, now = Date.now()): InsightsResponse {
   const { route, liveVehicles, hazards } = data;
+  if (liveVehicles === 0 && hazards.length === 0) {
+    return {
+      summary_en: `No FogRadar data for this route right now (${route}: 0 connected vehicles and 0 corroborated hazard reports). Actual road, traffic, and visibility conditions are unknown because unconnected vehicles and unreported hazards are not detected.`,
+      summary_ur: `اس وقت ${route} کے لیے کوئی FogRadar ڈیٹا موجود نہیں ہے (0 منسلک گاڑیاں اور 0 تصدیق شدہ رپورٹس)۔ سڑک، ٹریفک یا حدِ نگاہ کی اصل صورتحال معلوم نہیں ہے کیونکہ بغیر ایپ والی گاڑیاں اور غیر رپورٹ شدہ خطرات نظر نہیں آتے۔`,
+      generatedAt: now,
+    };
+  }
+
   if (hazards.length === 0) {
     return {
-      summary_en: `No corroborated hazards are currently active on ${route}, with ${liveVehicles} connected vehicle(s) sharing live GPS telemetry. Unconnected traffic is not visible on radar, so maintain safe headway and moderate speed in low visibility.`,
-      summary_ur: `${route} پر اس وقت کوئی تصدیق شدہ خطرہ موجود نہیں ہے اور ${liveVehicles} منسلک گاڑیاں لائیو ٹیلی میٹری شیئر کر رہی ہیں۔ ایپ کے بغیر گاڑیاں ریڈار پر نظر نہیں آتیں، اس لیے دھند میں محفوظ فاصلہ اور مناسب رفتار برقرار رکھیں۔`,
+      summary_en: `FogRadar currently tracks ${liveVehicles} connected vehicle(s) and 0 corroborated hazard reports on ${route}. Having 0 reports does not indicate what road or visibility conditions exist, as unconnected vehicles and unreported hazards remain undetected.`,
+      summary_ur: `اس وقت ${route} پر ${liveVehicles} منسلک گاڑیاں ٹریک ہو رہی ہیں اور 0 تصدیق شدہ خطرات رپورٹ ہوئے ہیں۔ صفر رپورٹس سے سڑک یا حدِ نگاہ کی صورتحال معلوم نہیں ہوتی کیونکہ بغیر ایپ والی گاڑیاں اور غیر رپورٹ شدہ خطرات نظر نہیں آتے۔`,
       generatedAt: now,
     };
   }
@@ -73,8 +81,8 @@ export function buildDeterministicInsights(data: RouteInsightsData, now = Date.n
     .join('؛ ');
 
   return {
-    summary_en: `On ${route}, ${hazards.length} corroborated hazard(s) are active — ${detailsEn} — alongside ${liveVehicles} live connected vehicle(s). Reduce speed immediately, increase following distance, and stay alert for sudden slowdowns.`,
-    summary_ur: `${route} پر اس وقت ${hazards.length} تصدیق شدہ خطرات موجود ہیں — ${detailsUr} — اور ${liveVehicles} منسلک گاڑیاں لائیو ٹریک ہو رہی ہیں۔ براہِ کرم رفتار کم کریں، اگلی گاڑی سے فاصلہ بڑھائیں اور احتیاط سے ڈرائیو کریں۔`,
+    summary_en: `On ${route}, ${hazards.length} corroborated hazard report(s) are active — ${detailsEn} — with ${liveVehicles} connected vehicle(s) currently sending telemetry. Unconnected vehicles and unreported hazards are not detected by FogRadar.`,
+    summary_ur: `${route} پر اس وقت ${hazards.length} تصدیق شدہ خطرات کی رپورٹس موجود ہیں — ${detailsUr} — اور ${liveVehicles} منسلک گاڑیاں ٹیلی میٹری بھیج رہی ہیں۔ بغیر ایپ والی گاڑیاں اور غیر رپورٹ شدہ خطرات FogRadar پر نظر نہیں آتے۔`,
     generatedAt: now,
   };
 }
@@ -87,7 +95,7 @@ export async function requestLlmInsights(
 ): Promise<InsightsResponse> {
   const trimmedKey = (apiKey ?? '').trim();
   const trimmedModel = (model ?? '').trim();
-  if (!trimmedKey || !trimmedModel) {
+  if (!trimmedKey || !trimmedModel || (data.liveVehicles === 0 && data.hazards.length === 0)) {
     return buildDeterministicInsights(data, now);
   }
 
@@ -100,13 +108,16 @@ export async function requestLlmInsights(
               `${i + 1}. ${h.type} at (${h.latitude.toFixed(4)}, ${h.longitude.toFixed(4)}), age ${h.ageMinutes} min, confirmed by ${h.reportCount} vehicles`
           )
           .join('\n')
-      : 'None (0 active corroborated hazards)';
+      : 'None (0 active corroborated hazard reports)';
 
   const prompt = [
-    `You are generating an advisory summary for FogRadar on Pakistan's ${data.route}.`,
+    `You summarize only the provided FogRadar telemetry for Pakistan's ${data.route}.`,
     `Live connected vehicles on route: ${data.liveVehicles}.`,
-    `Active corroborated hazards:\n${hazardLines}`,
-    `Write a concise 2-sentence road safety summary in English (summary_en) and a 2-sentence road safety summary in Urdu (summary_ur) reflecting this exact telemetry.`,
+    `Active corroborated hazard reports:\n${hazardLines}`,
+    `Write a concise 2-sentence summary in English (summary_en) and a 2-sentence summary in Urdu (summary_ur) following these strict rules:`,
+    `- When live connected vehicles is 0 and active corroborated hazard reports is 0, summary_en MUST begin with "No FogRadar data for this route right now" and state that actual road and visibility conditions are unknown.`,
+    `- NEVER claim or imply that road, traffic, or travel conditions are clear, open, normal, or safe.`,
+    `- NEVER state road, weather, or visibility conditions that are not explicitly shown in the data above; always note that unconnected vehicles and unreported hazards are not detected.`,
     `Respond ONLY with valid JSON in this exact shape: {"summary_en":"...","summary_ur":"..."}`,
   ].join('\n');
 
@@ -124,7 +135,7 @@ export async function requestLlmInsights(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
+          generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
         }),
         signal: controller.signal,
       });
@@ -143,12 +154,13 @@ export async function requestLlmInsights(
         },
         body: JSON.stringify({
           model: trimmedModel,
-          temperature: 0.2,
+          temperature: 0.1,
           response_format: { type: 'json_object' },
           messages: [
             {
               role: 'system',
-              content: 'You output only valid JSON objects with keys "summary_en" and "summary_ur".',
+              content:
+                'You output only valid JSON objects with keys "summary_en" and "summary_ur". Never claim roads are clear or safe, and never state conditions not shown by the telemetry.',
             },
             { role: 'user', content: prompt },
           ],
@@ -183,4 +195,3 @@ export async function requestLlmInsights(
     clearTimeout(timer);
   }
 }
-

@@ -9,8 +9,19 @@ test('normalizeRouteParam maps shorthand and full motorway names', () => {
   assert.equal(normalizeRouteParam('invalid'), 'M-2 Motorway');
 });
 
-test('deterministic fallback returns English and Urdu summaries without errors', async () => {
-  const res = await requestLlmInsights(
+test('when there are no vehicles and no hazards, states No FogRadar data and never claims road is clear or safe', () => {
+  const emptyRes = buildDeterministicInsights(
+    { route: 'M-2 Motorway', liveVehicles: 0, hazards: [] },
+    1700000000000
+  );
+  assert.equal(emptyRes.generatedAt, 1700000000000);
+  assert.match(emptyRes.summary_en, /No FogRadar data for this route right now/);
+  assert.doesNotMatch(emptyRes.summary_en, /\b(clear|safe)\b/i);
+  assert.match(emptyRes.summary_ur, /کوئی FogRadar ڈیٹا موجود نہیں/);
+});
+
+test('deterministic fallback with vehicles or hazards reports only observed telemetry', async () => {
+  const withHazards = await requestLlmInsights(
     {
       route: 'M-2 Motorway',
       liveVehicles: 4,
@@ -26,20 +37,21 @@ test('deterministic fallback returns English and Urdu summaries without errors',
     },
     undefined,
     undefined,
-    1700000000000
+    1700000001000
   );
-  assert.equal(res.generatedAt, 1700000000000);
-  assert.match(res.summary_en, /M-2 Motorway/);
-  assert.match(res.summary_en, /Heavy fog/);
-  assert.match(res.summary_en, /4 live connected vehicle/);
-  assert.match(res.summary_ur, /M-2 Motorway/);
-  assert.match(res.summary_ur, /شدید دھند/);
+  assert.equal(withHazards.generatedAt, 1700000001000);
+  assert.match(withHazards.summary_en, /M-2 Motorway/);
+  assert.match(withHazards.summary_en, /Heavy fog/);
+  assert.match(withHazards.summary_en, /4 connected vehicle/);
+  assert.doesNotMatch(withHazards.summary_en, /\b(clear|safe)\b/i);
+  assert.match(withHazards.summary_ur, /M-2 Motorway/);
+  assert.match(withHazards.summary_ur, /شدید دھند/);
 
-  const clearRes = buildDeterministicInsights(
+  const vehiclesOnly = buildDeterministicInsights(
     { route: 'M-3 Motorway', liveVehicles: 2, hazards: [] },
     1700000005000
   );
-  assert.match(clearRes.summary_en, /No corroborated hazards/);
-  assert.match(clearRes.summary_ur, /M-3 Motorway/);
+  assert.match(vehiclesOnly.summary_en, /2 connected vehicle\(s\) and 0 corroborated hazard reports/);
+  assert.doesNotMatch(vehiclesOnly.summary_en, /\b(clear|safe)\b/i);
+  assert.match(vehiclesOnly.summary_ur, /M-3 Motorway/);
 });
-
