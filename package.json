@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "doctor": "expo-doctor",
     "smoke:two-phones": "node scripts/smoke-two-phones.mjs",
-    "test:proximity": "node --experimental-strip-types scripts/test-proximity.mjs"
+    "test:proximity": "node --experimental-strip-types scripts/test-proximity.mjs",
+    "test:geometry": "node --experimental-strip-types scripts/test-road-geometry.mjs"
   },
   "dependencies": {
     "expo": "~58.0.22",
