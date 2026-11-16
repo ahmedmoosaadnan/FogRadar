@@ -11,7 +11,7 @@ import {C} from '../../src/theme/colors';
 
 export default function Radar(){
  const {gpsState,location,startedAt,refreshLocation}=useJourney();
- const {status,vehicles,updatedAt,error,hazards,apiUrl,lastUploadAt,lastUploadError}=useCloud();
+ const {status,vehicles,updatedAt,error,hazards,apiUrl,lastUploadAt,lastUploadError,snapshotReceivedCount}=useCloud();
  const [clock,setClock]=useState(Date.now());
  useEffect(()=>{const timer=setInterval(()=>setClock(Date.now()),500);return()=>clearInterval(timer);},[]);
  const fixAge=location?Math.max(0,clock-location.timestamp):null;
@@ -32,6 +32,7 @@ export default function Radar(){
    <View style={s.dataCard}><Icon name="road" color={C.emerald}/><Text style={s.dataValue}>{freshFix&&location?.heading!=null?`${location.heading}°`:'—'}</Text><Text style={s.dataLabel}>Travel heading</Text></View>
   </View>
   <Text style={s.subnote}>GPS: {fixAge===null?'no fix':`${(fixAge/1000).toFixed(1)}s old`} · Accuracy ±{ownAccuracy??'—'}m · Radar: {feedAge===null?'none':`${(feedAge/1000).toFixed(1)}s old`}</Text>
+  <Text style={s.subnote}>Snapshot: {feedAge===null?'none':`${(feedAge/1000).toFixed(1)}s old`} · Received: {snapshotReceivedCount} · Drawn: {liveVehicles.length}</Text>
   <Text style={s.subnote}>Last GPS server upload: {lastUploadAt?new Date(lastUploadAt).toLocaleTimeString():'Not accepted yet'}</Text>
   {liveVehicles.length>0?<View style={s.listCard}><Text style={s.listTitle}>Nearby connected devices ({liveVehicles.length})</Text>{liveVehicles.slice(0,12).map((v,index)=>{
    const cat=proximityColor(v.distanceMeters,ownAccuracy,v.accuracyMeters);

@@ -13,6 +13,7 @@ type ProbeResult = {ok:boolean;message:string;latencyMs:number|null};
 type CloudState = {
  status:CloudStatus;error:string|null;vehicles:NearbyVehicle[];hazards:LiveHazard[];
  updatedAt:number|null;lastUploadAt:number|null;lastUploadError:string|null;
+ snapshotReceivedCount:number;
  apiUrl:string;setServerUrl:(url:string)=>void;probeServer:(url?:string)=>Promise<ProbeResult>;
  reportHazard:(type:HazardType)=>Promise<HazardAck>;
 };
@@ -32,6 +33,7 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
  const [updatedAt,setUpdatedAt] = useState<number|null>(null);
  const [lastUploadAt,setLastUploadAt] = useState<number|null>(null);
  const [lastUploadError,setLastUploadError] = useState<string|null>(null);
+ const [snapshotReceivedCount,setSnapshotReceivedCount] = useState(0);
  const socketRef = useRef<Socket|null>(null);
  const lastSentRef = useRef(0);
  const alertedRef = useRef(new Set<string>());
@@ -88,7 +90,7 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
  useEffect(()=>{
   if(!startedAt || gpsState!=='tracking') {
    socketRef.current?.disconnect();socketRef.current=null;
-   setVehicles([]);setHazards([]);setUpdatedAt(null);setLastUploadAt(null);
+   setVehicles([]);setHazards([]);setUpdatedAt(null);setLastUploadAt(null);setSnapshotReceivedCount(0);
    setStatus(apiUrl?'idle':'not-configured');setError(null);
    alertedRef.current.clear();lastSentRef.current=0;
    return;
@@ -116,11 +118,26 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
       if(locationRef.current)sendTelemetry(locationRef.current);
      }
     });
-    sock.on('disconnect',(reason:string)=>{if(!cancelled){setStatus('offline');setError(`Socket disconnected: ${reason}`);setVehicles([]);setHazards([]);setUpdatedAt(null);}});
+    sock.on('disconnect',(reason:string)=>{if(!cancelled){setStatus('offline');setError(`Socket disconnected: ${reason}`);setVehicles([]);setHazards([]);setUpdatedAt(null);setSnapshotReceivedCount(0);}});
     sock.on('connect_error',(e:Error)=>{if(!cancelled){setStatus('offline');setError(`WebSocket: ${e.message}`);}});
     sock.on('radar:snapshot',(payload:{vehicles?:NearbyVehicle[]})=>{
      if(cancelled)return;
-     const valid=(Array.isArray(payload?.vehicles)?payload.vehicles:[]).filter(v=>Number.isFinite(v.distanceMeters)&&v.distanceMeters>=0&&v.distanceMeters<=1000&&v.ageMs<=15_000);
+     const rawList=Array.isArray(payload?.vehicles)?payload.vehicles:[];
+     const valid:NearbyVehicle[]=[];
+     const filteredOut:Array<{id:string;reason:string}>=[];
+     for(const v of rawList){
+      if(!Number.isFinite(v.distanceMeters)||v.distanceMeters<0||v.distanceMeters>1000){
+       filteredOut.push({id:v.id,reason:`distance=${v.distanceMeters}`});
+       continue;
+      }
+      if(!Number.isFinite(v.ageMs)||v.ageMs>15_000){
+       filteredOut.push({id:v.id,reason:`ageMs=${v.ageMs}`});
+       continue;
+      }
+      valid.push(v);
+     }
+     console.log('[FogRadar] radar:snapshot received',{received:rawList.length,accepted:valid.length,filteredOut});
+     setSnapshotReceivedCount(rawList.length);
      setVehicles(valid);setUpdatedAt(Date.now());
     });
     sock.on('hazards:snapshot',(payload:{hazards?:LiveHazard[]})=>{
@@ -170,7 +187,7 @@ export function CloudProvider({children}:{children:React.ReactNode}) {
    resolve(e?{ok:false,error:'Server timeout; status unknown, do not immediately retry'}:result??{ok:false,error:'No response'});
   }));
  },[location]);
- const value=useMemo(()=>({status,error,vehicles,hazards,updatedAt,lastUploadAt,lastUploadError,apiUrl,setServerUrl,probeServer,reportHazard}),[status,error,vehicles,hazards,updatedAt,lastUploadAt,lastUploadError,apiUrl,setServerUrl,probeServer,reportHazard]);
+ const value=useMemo(()=>({status,error,vehicles,hazards,updatedAt,lastUploadAt,lastUploadError,snapshotReceivedCount,apiUrl,setServerUrl,probeServer,reportHazard}),[status,error,vehicles,hazards,updatedAt,lastUploadAt,lastUploadError,snapshotReceivedCount,apiUrl,setServerUrl,probeServer,reportHazard]);
  return <CloudContext.Provider value={value}>{children}</CloudContext.Provider>;
 }
 export function useCloud():CloudState {const value=useContext(CloudContext);if(!value)throw Error('useCloud requires CloudProvider');return value;}

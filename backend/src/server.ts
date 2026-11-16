@@ -17,7 +17,7 @@ const rawDbUrl=process.env.DATABASE_URL;
 if(!rawDbUrl)throw new Error('DATABASE_URL environment variable is required');
 const port=Number(process.env.PORT||4000);
 const corsOrigin=!process.env.CORS_ORIGIN||process.env.CORS_ORIGIN==='*'?true:process.env.CORS_ORIGIN.split(',').map(s=>s.trim());
-const app=Fastify({logger:true,bodyLimit:16*1024});
+const app=Fastify({logger:{level:process.env.LOG_LEVEL||'debug'},bodyLimit:16*1024});
 await app.register(cors,{origin:corsOrigin});
 const redis=createClient({
  url:redisUrl,
@@ -93,13 +93,25 @@ app.post('/v1/session',async(req,reply)=>{
  return {...info,warning:'EXPERIMENTAL DATA: NOT AN APPROVED ROAD SAFETY SERVICE'};
 });
 const validNum=(value:unknown,min:number,max:number):value is number=>typeof value==='number'&&Number.isFinite(value)&&value>=min&&value<=max;
+function normalizeRoute(raw:unknown):string|null{
+ if(typeof raw!=='string')return null;
+ const trimmed=raw.trim();
+ if(routes.has(trimmed))return trimmed;
+ const shortMatch=/^(M-[123459])(?:\s+Motorway)?$/i.exec(trimmed);
+ if(shortMatch){
+  const canonical=`${shortMatch[1].toUpperCase()} Motorway`;
+  if(routes.has(canonical))return canonical;
+ }
+ return null;
+}
 function parseFix(raw:unknown):Fix|null{
  if(!raw || typeof raw!=='object')return null;
  const x=raw as Record<string,unknown>,now=Date.now();
- if(!validNum(x.latitude,-90,90)||!validNum(x.longitude,-180,180)||!validNum(x.accuracyMeters,0,50000)||!validNum(x.timestamp,now-300_000,now+300_000)||typeof x.route!=='string'||!routes.has(x.route))return null;
+ const route=normalizeRoute(x.route);
+ if(!validNum(x.latitude,-90,90)||!validNum(x.longitude,-180,180)||!validNum(x.accuracyMeters,0,50000)||!validNum(x.timestamp,now-300_000,now+300_000)||!route)return null;
  if(x.speedKmh!==null&&!validNum(x.speedKmh,0,220))return null;
  if(x.heading!==null&&!validNum(x.heading,0,360))return null;
- return {latitude:x.latitude,longitude:x.longitude,accuracyMeters:x.accuracyMeters,timestamp:x.timestamp,route:x.route,speedKmh:x.speedKmh as number|null,heading:x.heading as number|null,seenAt:now};
+ return {latitude:x.latitude,longitude:x.longitude,accuracyMeters:x.accuracyMeters,timestamp:x.timestamp,route,speedKmh:x.speedKmh as number|null,heading:x.heading as number|null,seenAt:now};
 }
 async function getFix(id:string):Promise<Fix|null>{
  const data=await redis.get(`fog:live:vehicle:${id}`);
@@ -119,18 +131,24 @@ async function removeFix(id:string){
 async function nearby(id:string,own:Fix){
  const ids=(await redis.sendCommand(['GEOSEARCH',GEO_KEY,'FROMLONLAT',String(own.longitude),String(own.latitude),'BYRADIUS','1000','m','COUNT','150'])) as string[];
  const others=ids.filter(v=>v!==id);
- if(!others.length)return [];
- const records=await redis.mGet(others.map(v=>`fog:live:vehicle:${v}`));
+ const selfExcluded=ids.length-others.length;
+ let missingRecord=0,filteredStale=0,filteredRoute=0,filteredDistance=0;
  const visible: Array<{id:string;distanceMeters:number;bearing:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;ageMs:number}>=[];
- records.forEach((raw,index)=>{
-  if(!raw)return;
-  try{const v=JSON.parse(raw) as Fix,age=Date.now()-v.seenAt;
-   if(age>12_000 || v.route!==own.route)return;
-   const distance=metersBetween(own,v);
-   if(distance>1000)return;
-   visible.push({id:others[index],distanceMeters:Math.round(distance),bearing:Math.round(bearingDegrees(own,v)),speedKmh:v.speedKmh,heading:v.heading,accuracyMeters:v.accuracyMeters,ageMs:age});
-  }catch{ /* ignore corrupted ephemeral entries */ }
- });
+ if(others.length){
+  const records=await redis.mGet(others.map(v=>`fog:live:vehicle:${v}`));
+  records.forEach((raw,index)=>{
+   if(!raw){missingRecord+=1;return;}
+   try{
+    const v=JSON.parse(raw) as Fix,age=Date.now()-v.seenAt;
+    if(age>12_000){filteredStale+=1;return;}
+    if(v.route!==own.route){filteredRoute+=1;return;}
+    const distance=metersBetween(own,v);
+    if(distance>1000){filteredDistance+=1;return;}
+    visible.push({id:others[index],distanceMeters:Math.round(distance),bearing:Math.round(bearingDegrees(own,v)),speedKmh:v.speedKmh,heading:v.heading,accuracyMeters:v.accuracyMeters,ageMs:age});
+   }catch{ /* ignore corrupted ephemeral entries */ }
+  });
+ }
+ app.log.debug({vehicleId:id,route:own.route,geoSearchTotal:ids.length,selfExcluded,missingRecord,filteredStale,filteredRoute,filteredDistance,returned:visible.length},'nearby GEOSEARCH summary');
  return visible.sort((a,b)=>a.distanceMeters-b.distanceMeters).slice(0,80);
 }
 type HazardRow={id:string;type:string;route:string;latitude:number;longitude:number;heading:number;report_count:number;expires_at:Date};
@@ -146,9 +164,22 @@ async function hazardsAhead(own:Fix){
 }
 async function snapshot(socket:AuthedSocket){
  const own=await getFix(socket.data.vehicleId);
- if(!own){socket.emit('radar:snapshot',{vehicles:[],serverTime:Date.now()});socket.emit('hazards:snapshot',{hazards:[],serverTime:Date.now()});return;}
- const [vehicles,hazards]=await Promise.all([nearby(socket.data.vehicleId,own),hazardsAhead(own)]);
- if(socket.connected){socket.emit('radar:snapshot',{vehicles,serverTime:Date.now()});socket.emit('hazards:snapshot',{hazards,serverTime:Date.now()});}
+ if(!own){
+  app.log.debug({vehicleId:socket.data.vehicleId},'snapshot: no fresh own fix in Redis, emitting empty radar:snapshot');
+  socket.emit('radar:snapshot',{vehicles:[],serverTime:Date.now()});
+  socket.emit('hazards:snapshot',{hazards:[],serverTime:Date.now()});
+  return;
+ }
+ const [nearbyRes,hazardsRes]=await Promise.allSettled([nearby(socket.data.vehicleId,own),hazardsAhead(own)]);
+ const vehicles=nearbyRes.status==='fulfilled'?nearbyRes.value:[];
+ const hazards=hazardsRes.status==='fulfilled'?hazardsRes.value:[];
+ if(nearbyRes.status==='rejected')app.log.error(nearbyRes.reason,'nearby() failed during snapshot');
+ if(hazardsRes.status==='rejected')app.log.error(hazardsRes.reason,'hazardsAhead() failed during snapshot');
+ if(socket.connected){
+  socket.emit('radar:snapshot',{vehicles,serverTime:Date.now()});
+  socket.emit('hazards:snapshot',{hazards,serverTime:Date.now()});
+  app.log.debug({vehicleId:socket.data.vehicleId,route:own.route,vehiclesEmitted:vehicles.length,hazardsEmitted:hazards.length},'snapshot emitted');
+ }
 }
 type Ack=(response:{ok:boolean;error?:string;id?:string;status?:string;reportCount?:number})=>void;
 async function reportHazard(socket:AuthedSocket,body:unknown){
@@ -202,15 +233,35 @@ io.use((socket,next)=>{
 io.on('connection',base=>{
  const socket=base as AuthedSocket;
  socket.on('telemetry:update',async(raw:unknown,ack?:Ack)=>{
+  const vehicleId=socket.data.vehicleId;
+  const rawRoute=raw&&typeof raw==='object'?(raw as {route?:unknown}).route:undefined;
+  const normalizedRoute=normalizeRoute(rawRoute)??String(rawRoute??'');
   try{
-   const fix=parseFix(raw);if(!fix){ack?.({ok:false,error:'Invalid GPS data or age/accuracy'});return;}
-   const previous=await getFix(socket.data.vehicleId);
-   if(previous && fix.timestamp<=previous.timestamp){ack?.({ok:false,error:'Out-of-order update'});return;}
-   if(previous && fix.timestamp-previous.timestamp<500){ack?.({ok:false,error:'Update rate exceeded'});return;}
-   if(previous && fix.timestamp-previous.timestamp<20_000 && metersBetween(fix,previous)/Math.max(0.5,(fix.timestamp-previous.timestamp)/1000)>75){ack?.({ok:false,error:'GPS jump rejected'});return;}
-   await putFix(socket.data.vehicleId,fix);
+   const fix=parseFix(raw);
+   if(!fix){
+    app.log.debug({vehicleId,route:normalizedRoute,accepted:false,reason:'Invalid GPS data or age/accuracy'},'telemetry:update');
+    ack?.({ok:false,error:'Invalid GPS data or age/accuracy'});return;
+   }
+   const previous=await getFix(vehicleId);
+   if(previous && fix.timestamp<=previous.timestamp){
+    app.log.debug({vehicleId,route:fix.route,accepted:false,reason:'Out-of-order update'},'telemetry:update');
+    ack?.({ok:false,error:'Out-of-order update'});return;
+   }
+   if(previous && fix.timestamp-previous.timestamp<500){
+    app.log.debug({vehicleId,route:fix.route,accepted:false,reason:'Update rate exceeded'},'telemetry:update');
+    ack?.({ok:false,error:'Update rate exceeded'});return;
+   }
+   if(previous && fix.timestamp-previous.timestamp<20_000 && metersBetween(fix,previous)/Math.max(0.5,(fix.timestamp-previous.timestamp)/1000)>75){
+    app.log.debug({vehicleId,route:fix.route,accepted:false,reason:'GPS jump rejected'},'telemetry:update');
+    ack?.({ok:false,error:'GPS jump rejected'});return;
+   }
+   await putFix(vehicleId,fix);
+   app.log.debug({vehicleId,route:fix.route,accepted:true,reason:'ok'},'telemetry:update');
    ack?.({ok:true});await snapshot(socket);
-  }catch(e){app.log.error(e);ack?.({ok:false,error:'Server processing failed'});}
+  }catch(e){
+   app.log.debug({vehicleId,route:normalizedRoute,accepted:false,reason:'Server processing failed'},'telemetry:update');
+   app.log.error(e);ack?.({ok:false,error:'Server processing failed'});
+  }
  });
  socket.on('hazard:report',async(body:unknown,ack?:Ack)=>{
   try{const r=await reportHazard(socket,body);ack?.({ok:true,...r});}
