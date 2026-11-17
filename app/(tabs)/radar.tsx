@@ -4,6 +4,7 @@ import { router } from 'expo-router';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
+import { Accelerometer, Magnetometer } from 'expo-sensors';
 import {
   formatVehicleDistance,
   RoadRadarView,
@@ -13,14 +14,26 @@ import {
 import { Icon } from '../../src/components/Icons';
 import { useJourney } from '../../src/context/JourneyContext';
 import { useCloud } from '../../src/cloud/CloudContext';
-import { C } from '../../src/theme/colors';
 import {
   createHeadingTrackerState,
   updateHeadingTracker,
   type HeadingSource,
 } from '../../src/utils/roadGeometry';
+import { computeTiltCompensatedHeading, type Vec3 } from '../../src/utils/compassFallback';
 
 const TAB_BAR_HEIGHT = 66;
+
+type HeadingDebugInfo = {
+  permStatus: string;
+  permAccuracy: string;
+  watchActive: boolean;
+  sensorFallbackActive: boolean;
+  watchError: string | null;
+  rawTrueHeading: number | null;
+  rawMagHeading: number | null;
+  rawAccuracy: number | null;
+  rawTimestamp: number | null;
+};
 
 export default function Radar() {
   const insets = useSafeAreaInsets();
@@ -38,9 +51,27 @@ export default function Radar() {
   } = useCloud();
   const [clock, setClock] = useState(Date.now());
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showHeadingDebug, setShowHeadingDebug] = useState(false);
 
-  const compassRef = useRef<number | null>(null);
+  const compassRef = useRef<{ heading: number | null; uncalibrated: boolean }>({
+    heading: null,
+    uncalibrated: false,
+  });
   const trackerRef = useRef(createHeadingTrackerState());
+  const [compassTick, setCompassTick] = useState(0);
+  const [compassUncalibrated, setCompassUncalibrated] = useState(false);
+  const [headingDebug, setHeadingDebug] = useState<HeadingDebugInfo>({
+    permStatus: Platform.OS === 'web' ? 'web' : 'checking…',
+    permAccuracy: 'unknown',
+    watchActive: false,
+    sensorFallbackActive: false,
+    watchError: null,
+    rawTrueHeading: null,
+    rawMagHeading: null,
+    rawAccuracy: null,
+    rawTimestamp: null,
+  });
+
   const [headingState, setHeadingState] = useState<{
     effectiveHeading: number | null;
     source: HeadingSource;
@@ -52,37 +83,165 @@ export default function Radar() {
     return () => clearInterval(timer);
   }, []);
 
-  // Native-only device compass fallback via expo-location watchHeadingAsync
+  // Start device compass as soon as Radar screen mounts (native only; on web keep heading unknown)
   useEffect(() => {
-    if (Platform.OS === 'web' || gpsState !== 'tracking') {
-      compassRef.current = null;
+    if (Platform.OS === 'web') {
+      compassRef.current = { heading: null, uncalibrated: false };
+      setHeadingDebug(prev => ({
+        ...prev,
+        permStatus: 'web',
+        permAccuracy: 'n/a',
+        watchActive: false,
+        sensorFallbackActive: false,
+      }));
       return;
     }
+
     let active = true;
-    let sub: Location.LocationSubscription | null = null;
-    void Location.watchHeadingAsync(h => {
-      if (!active) return;
-      const heading =
-        Number.isFinite(h.trueHeading) && h.trueHeading >= 0
-          ? h.trueHeading
-          : Number.isFinite(h.magHeading) && h.magHeading >= 0
-            ? h.magHeading
-            : null;
-      compassRef.current = heading;
-    })
-      .then(subscription => {
-        if (!active) subscription.remove();
-        else sub = subscription;
-      })
-      .catch(() => {
-        compassRef.current = null;
-      });
+    let headingSub: Location.LocationSubscription | null = null;
+    let magSub: { remove: () => void } | null = null;
+    let accelSub: { remove: () => void } | null = null;
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    let gotWatchHeading = false;
+    let lastAccel: Vec3 | null = null;
+
+    const startSensorFallback = () => {
+      if (!active || gotWatchHeading) return;
+      try {
+        Accelerometer.setUpdateInterval(200);
+        Magnetometer.setUpdateInterval(200);
+        accelSub = Accelerometer.addListener(data => {
+          lastAccel = data;
+        });
+        magSub = Magnetometer.addListener(mag => {
+          if (!active || gotWatchHeading) return;
+          const computed = computeTiltCompensatedHeading(mag, lastAccel);
+          if (computed !== null) {
+            compassRef.current = { heading: computed, uncalibrated: true };
+            setCompassUncalibrated(true);
+            setCompassTick(t => (t + 1) % 100000);
+            setHeadingDebug(prev => ({
+              ...prev,
+              sensorFallbackActive: true,
+              rawMagHeading: Math.round(computed),
+              rawAccuracy: 0,
+              rawTimestamp: Date.now(),
+            }));
+          }
+        });
+        setHeadingDebug(prev => ({ ...prev, sensorFallbackActive: true }));
+      } catch (e) {
+        if (active) {
+          setHeadingDebug(prev => ({
+            ...prev,
+            watchError: `Sensors: ${e instanceof Error ? e.message : 'unavailable'}`,
+          }));
+        }
+      }
+    };
+
+    (async () => {
+      try {
+        let perm = await Location.getForegroundPermissionsAsync();
+        if (perm.status !== 'granted') {
+          perm = await Location.requestForegroundPermissionsAsync();
+        }
+        if (!active) return;
+
+        const permAny = perm as unknown as {
+          status: string;
+          android?: { accuracy?: string };
+          ios?: { scope?: string };
+        };
+        const accuracyScope =
+          permAny.android?.accuracy ?? permAny.ios?.scope ?? (perm.granted ? 'granted' : 'denied');
+        setHeadingDebug(prev => ({
+          ...prev,
+          permStatus: perm.status,
+          permAccuracy: String(accuracyScope),
+        }));
+
+        if (perm.status !== 'granted') {
+          setHeadingDebug(prev => ({
+            ...prev,
+            watchActive: false,
+            watchError: 'Foreground location permission not granted',
+          }));
+          return;
+        }
+
+        // Fallback to expo-sensors if watchHeadingAsync yields nothing within 5 seconds
+        fallbackTimer = setTimeout(startSensorFallback, 5000);
+
+        const sub = await Location.watchHeadingAsync(h => {
+          if (!active) return;
+          const rawTrue = Number.isFinite(h.trueHeading) ? h.trueHeading : null;
+          const rawMag = Number.isFinite(h.magHeading) ? h.magHeading : null;
+          const rawAcc = Number.isFinite(h.accuracy) ? h.accuracy : null;
+
+          // trueHeading is -1 when unavailable -> fall back to magHeading
+          const chosen =
+            rawTrue !== null && rawTrue >= 0
+              ? rawTrue
+              : rawMag !== null && rawMag >= 0
+                ? rawMag
+                : null;
+
+          if (chosen !== null) {
+            gotWatchHeading = true;
+            if (fallbackTimer) {
+              clearTimeout(fallbackTimer);
+              fallbackTimer = null;
+            }
+            magSub?.remove();
+            magSub = null;
+            accelSub?.remove();
+            accelSub = null;
+
+            // accuracy <= 0 means uncalibrated: still use it, mark uncalibrated
+            const uncal = rawAcc === null || rawAcc <= 0;
+            compassRef.current = { heading: chosen, uncalibrated: uncal };
+            setCompassUncalibrated(uncal);
+            setCompassTick(t => (t + 1) % 100000);
+            setHeadingDebug(prev => ({
+              ...prev,
+              watchActive: true,
+              sensorFallbackActive: false,
+              watchError: null,
+              rawTrueHeading: rawTrue,
+              rawMagHeading: rawMag,
+              rawAccuracy: rawAcc,
+              rawTimestamp: Date.now(),
+            }));
+          }
+        });
+
+        if (!active) {
+          sub.remove();
+          return;
+        }
+        headingSub = sub;
+        setHeadingDebug(prev => ({ ...prev, watchActive: true, watchError: null }));
+      } catch (e) {
+        if (!active) return;
+        setHeadingDebug(prev => ({
+          ...prev,
+          watchActive: false,
+          watchError: e instanceof Error ? e.message : 'watchHeadingAsync failed',
+        }));
+        startSensorFallback();
+      }
+    })();
+
     return () => {
       active = false;
-      sub?.remove();
-      compassRef.current = null;
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      headingSub?.remove();
+      magSub?.remove();
+      accelSub?.remove();
+      compassRef.current = { heading: null, uncalibrated: false };
     };
-  }, [gpsState]);
+  }, []);
 
   const fixAge = location ? Math.max(0, clock - location.timestamp) : null;
   const freshFix = gpsState === 'tracking' && location !== null && fixAge !== null && fixAge <= 15000;
@@ -93,28 +252,16 @@ export default function Radar() {
   const ownAccuracy = freshFix ? location?.accuracyMeters ?? null : null;
 
   useEffect(() => {
-    const compassHeadingDeg = Platform.OS === 'web' ? null : compassRef.current;
-    if (!freshFix || !location) {
-      const res = updateHeadingTracker(trackerRef.current, {
-        speedMps: null,
-        headingDeg: null,
-        accuracyMeters: null,
-        compassHeadingDeg,
-        now: Date.now(),
-      });
-      trackerRef.current = res.state;
-      setHeadingState({
-        effectiveHeading: res.effectiveHeading,
-        source: res.source,
-        yawRateDegPerSec: res.yawRateDegPerSec,
-      });
-      return;
-    }
+    const compassHeadingDeg = Platform.OS === 'web' ? null : compassRef.current.heading;
+    const speedMps =
+      freshFix && location && location.speedKmh !== null ? location.speedKmh / 3.6 : null;
+    const gpsHeadingDeg = freshFix && location ? location.heading : null;
+    const gpsAcc = freshFix && location ? location.accuracyMeters : null;
 
     const res = updateHeadingTracker(trackerRef.current, {
-      speedMps: location.speedKmh !== null ? location.speedKmh / 3.6 : null,
-      headingDeg: location.heading,
-      accuracyMeters: location.accuracyMeters,
+      speedMps,
+      headingDeg: gpsHeadingDeg,
+      accuracyMeters: gpsAcc,
       compassHeadingDeg,
       now: Date.now(),
     });
@@ -124,7 +271,7 @@ export default function Radar() {
       source: res.source,
       yawRateDegPerSec: res.yawRateDegPerSec,
     });
-  }, [freshFix, location, clock]);
+  }, [freshFix, location, clock, compassTick]);
 
   const statusLabel = freshFeed
     ? '● LIVE · Cloud connected'
@@ -133,7 +280,7 @@ export default function Radar() {
       : !startedAt
         ? '● Journey not started'
         : status === 'connecting'
-          ? '● Connecting to cloud…'
+          ? '● Connecting to FogRadar…'
           : status === 'online'
             ? '● Waiting for fresh GPS'
             : '● Cloud offline';
@@ -142,8 +289,21 @@ export default function Radar() {
     headingState.source === 'gps'
       ? 'Heading: GPS'
       : headingState.source === 'compass'
-        ? 'Heading: Compass'
+        ? compassUncalibrated
+          ? 'Heading: Compass (uncalibrated)'
+          : 'Heading: Compass'
         : 'Heading: Unknown';
+
+  const unknownReason =
+    headingState.source !== 'unknown'
+      ? null
+      : Platform.OS === 'web'
+        ? 'Web browser (compass disabled; move ≥ 3 m/s for GPS course)'
+        : headingDebug.permStatus !== 'granted'
+          ? `Permission ${headingDebug.permStatus}`
+          : headingDebug.watchError
+            ? headingDebug.watchError
+            : 'Waiting for compass or GPS course (≥ 3 m/s)';
 
   return (
     <SafeAreaView style={s.safe} edges={['top']}>
@@ -166,9 +326,17 @@ export default function Radar() {
         <View style={s.chipRow}>
           <Pressable
             onPress={() => router.push('/server-connection')}
-            style={[s.banner, { backgroundColor: freshFeed ? '#064E3B' : '#451A03', borderColor: freshFeed ? '#10B981' : '#F59E0B' }]}
+            style={[
+              s.banner,
+              {
+                backgroundColor: freshFeed ? '#064E3B' : '#451A03',
+                borderColor: freshFeed ? '#10B981' : '#F59E0B',
+              },
+            ]}
           >
-            <Text style={[s.bannerText, { color: freshFeed ? '#A7F3D0' : '#FDE68A' }]}>{statusLabel}</Text>
+            <Text style={[s.bannerText, { color: freshFeed ? '#A7F3D0' : '#FDE68A' }]}>
+              {statusLabel}
+            </Text>
           </Pressable>
           <View
             style={[
@@ -201,11 +369,17 @@ export default function Radar() {
           </View>
         </View>
 
+        {headingState.source === 'compass' && compassUncalibrated ? (
+          <Text style={s.calHint}>Move phone in a figure-8 to calibrate compass</Text>
+        ) : null}
+
         {freshFeed && liveHazards.length > 0 ? (
           <View style={s.hazardBanner}>
             <Icon name="alert" color="white" size={22} />
             <View style={{ flex: 1 }}>
-              <Text style={s.hazardHeading}>HAZARD AHEAD · {formatVehicleDistance(liveHazards[0].distanceMeters)}</Text>
+              <Text style={s.hazardHeading}>
+                HAZARD AHEAD · {formatVehicleDistance(liveHazards[0].distanceMeters)}
+              </Text>
               <Text style={s.hazardLabel}>
                 {liveHazards[0].type} · {liveHazards[0].reportCount} confirming vehicles
               </Text>
@@ -219,7 +393,7 @@ export default function Radar() {
           effectiveHeading={headingState.effectiveHeading}
           headingSource={headingState.source}
           ownAccuracy={ownAccuracy}
-          ownSpeedKmh={freshFix ? location?.speedKmh ?? null : null}
+          ownSpeedKmh={freshFix && location?.speedKmh != null ? location.speedKmh : null}
           yawRateDegPerSec={headingState.yawRateDegPerSec}
           showOncoming={showOncoming}
         />
@@ -299,6 +473,39 @@ export default function Radar() {
             <Text style={s.advancedText}>
               Last GPS server upload: {lastUploadAt ? new Date(lastUploadAt).toLocaleTimeString() : 'Not accepted yet'}
             </Text>
+
+            <Pressable onPress={() => setShowHeadingDebug(v => !v)} style={s.subDebugToggle}>
+              <Text style={s.subDebugToggleText}>
+                {showHeadingDebug ? '▾ Heading debug' : '▸ Heading debug'}
+              </Text>
+            </Pressable>
+
+            {showHeadingDebug ? (
+              <View style={s.subDebugBox}>
+                <Text style={s.debugLine}>
+                  Platform: {Platform.OS} {String(Platform.Version)}
+                </Text>
+                <Text style={s.debugLine}>
+                  Permission: {headingDebug.permStatus} ({headingDebug.permAccuracy})
+                </Text>
+                <Text style={s.debugLine}>
+                  watchHeadingAsync: {headingDebug.watchActive ? 'active' : 'inactive'} · sensorFallback: {headingDebug.sensorFallbackActive ? 'active' : 'off'}
+                </Text>
+                {headingDebug.watchError ? (
+                  <Text style={s.debugError}>Compass error: {headingDebug.watchError}</Text>
+                ) : null}
+                <Text style={s.debugLine}>
+                  Raw compass: true={headingDebug.rawTrueHeading ?? '—'} · mag={headingDebug.rawMagHeading ?? '—'} · acc={headingDebug.rawAccuracy ?? '—'} · {headingDebug.rawTimestamp ? new Date(headingDebug.rawTimestamp).toLocaleTimeString() : 'no sample'}
+                </Text>
+                <Text style={s.debugLine}>
+                  GPS course={location?.heading ?? '—'}° · speed={location?.speedKmh ?? '—'} km/h · acc=±{location?.accuracyMeters ?? '—'}m
+                </Text>
+                <Text style={s.debugLine}>
+                  Chosen source: {headingState.source === 'compass' && compassUncalibrated ? 'compass (uncalibrated)' : headingState.source}
+                  {unknownReason ? ` (${unknownReason})` : ''}
+                </Text>
+              </View>
+            ) : null}
           </View>
         ) : null}
 
@@ -330,11 +537,12 @@ const s = StyleSheet.create({
   range: { alignItems: 'flex-end' },
   rangeText: { fontWeight: '900', color: '#34D399', fontSize: 18 },
   rangeSub: { fontSize: 9, color: '#94A3B8', letterSpacing: 1 },
-  chipRow: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center', gap: 8, marginBottom: 12 },
+  chipRow: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center', gap: 8, marginBottom: 8 },
   banner: { paddingHorizontal: 12, paddingVertical: 7, borderRadius: 20, borderWidth: 1 },
   bannerText: { fontSize: 11, fontWeight: '800', letterSpacing: 0.2 },
   headingChip: { paddingHorizontal: 10, paddingVertical: 7, borderRadius: 20, backgroundColor: '#0D1722', borderWidth: 1 },
   headingChipText: { fontSize: 11, fontWeight: '800' },
+  calHint: { color: '#FDE68A', fontSize: 11, fontWeight: '700', textAlign: 'center', marginBottom: 10 },
   hazardBanner: {
     backgroundColor: '#991B1B',
     borderRadius: 14,
@@ -407,6 +615,19 @@ const s = StyleSheet.create({
     gap: 4,
   },
   advancedText: { color: '#CBD5E1', fontSize: 11, textAlign: 'center' },
+  subDebugToggle: { marginTop: 8, alignSelf: 'center', paddingVertical: 4, paddingHorizontal: 10 },
+  subDebugToggleText: { color: '#93C5FD', fontSize: 11, fontWeight: '800' },
+  subDebugBox: {
+    marginTop: 6,
+    padding: 10,
+    borderRadius: 8,
+    backgroundColor: '#070D14',
+    borderWidth: 1,
+    borderColor: '#1E293B',
+    gap: 3,
+  },
+  debugLine: { color: '#94A3B8', fontSize: 10.5 },
+  debugError: { color: '#FCA5A5', fontSize: 10.5 },
   link: { marginTop: 14, alignItems: 'center', padding: 12, backgroundColor: '#175E42', borderRadius: 12 },
   linkText: { color: '#FFFFFF', fontWeight: '800', fontSize: 13 },
 });
