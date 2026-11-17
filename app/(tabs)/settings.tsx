@@ -115,6 +115,7 @@ export default function Settings() {
           <Icon name="shield" color={C.emerald} size={28} />
           <Text style={s.aboutTitle}>FogRadar v1.0</Text>
           <Text style={s.aboutText}>Cloud status: {status}</Text>
+          <Text style={s.aboutText}>Map data © OpenStreetMap contributors</Text>
         </View>
       </ScrollView>
     </SafeAreaView>

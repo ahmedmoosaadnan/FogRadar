@@ -14,6 +14,11 @@ export type NearbyVehicle = {
   accuracyMeters: number;
   ageMs: number;
   fixTime?: number;
+  oncoming?: boolean;
+};
+export type RoadShapePoint = {
+  forwardMeters: number;
+  lateralMeters: number;
 };
 export type LiveHazard = {
   id: string;
@@ -35,6 +40,7 @@ type CloudState = {
   status: CloudStatus;
   error: string | null;
   vehicles: NearbyVehicle[];
+  roadShape: RoadShapePoint[];
   hazards: LiveHazard[];
   insights: RoadInsights | null;
   updatedAt: number | null;
@@ -61,6 +67,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<CloudStatus>(compiledUrl ? 'idle' : 'not-configured');
   const [error, setError] = useState<string | null>(null);
   const [vehicles, setVehicles] = useState<NearbyVehicle[]>([]);
+  const [roadShape, setRoadShape] = useState<RoadShapePoint[]>([]);
   const [hazards, setHazards] = useState<LiveHazard[]>([]);
   const [insights, setInsights] = useState<RoadInsights | null>(null);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
@@ -199,6 +206,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
       socketRef.current?.disconnect();
       socketRef.current = null;
       setVehicles([]);
+      setRoadShape([]);
       setHazards([]);
       setInsights(null);
       setUpdatedAt(null);
@@ -276,6 +284,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
             setStatus('offline');
             setError(`Disconnected: ${reason}`);
             setVehicles([]);
+            setRoadShape([]);
             setHazards([]);
             setInsights(null);
             setUpdatedAt(null);
@@ -288,7 +297,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
             setError(`Connecting to FogRadar… (${e.message})`);
           }
         });
-        sock.on('radar:snapshot', (payload: { vehicles?: NearbyVehicle[]; serverTime?: number }) => {
+        sock.on('radar:snapshot', (payload: { vehicles?: NearbyVehicle[]; roadShape?: RoadShapePoint[]; serverTime?: number }) => {
           if (cancelled) return;
           const clientNow = Date.now();
           const rawList = Array.isArray(payload?.vehicles) ? payload.vehicles : [];
@@ -304,6 +313,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
           }
           setSnapshotReceivedCount(rawList.length);
           setVehicles(valid);
+          setRoadShape(Array.isArray(payload?.roadShape) ? payload.roadShape : []);
           setUpdatedAt(clientNow);
         });
         sock.on('insights:update', (payload: Partial<RoadInsights>) => {
@@ -401,6 +411,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
       status,
       error,
       vehicles,
+      roadShape,
       hazards,
       insights,
       updatedAt,
@@ -418,6 +429,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
       status,
       error,
       vehicles,
+      roadShape,
       hazards,
       insights,
       updatedAt,

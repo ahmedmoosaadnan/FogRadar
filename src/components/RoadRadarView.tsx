@@ -13,7 +13,7 @@ import Svg, {
   Stop,
   Text as SvgText,
 } from 'react-native-svg';
-import type { LiveHazard, NearbyVehicle } from '../cloud/CloudContext';
+import type { LiveHazard, NearbyVehicle, RoadShapePoint } from '../cloud/CloudContext';
 import { proximityColor, type ProximityColor } from '../utils/proximity';
 import {
   LANE_WIDTH_METERS,
@@ -67,39 +67,62 @@ function perspScale(t: number): number {
   return 1 - 0.56 * Math.max(0, Math.min(1, t));
 }
 
-function roadCenterX(t: number, curvePx: number): number {
+function roadCenterX(t: number, curvePx: number, roadShape: RoadShapePoint[] = []): number {
+  if (roadShape.length >= 2) {
+    const targetForward = t * t * 1000;
+    let lateralM = roadShape[roadShape.length - 1].lateralMeters;
+    for (let i = 0; i < roadShape.length - 1; i++) {
+      const a = roadShape[i];
+      const b = roadShape[i + 1];
+      if (targetForward <= b.forwardMeters || i === roadShape.length - 2) {
+        const span = b.forwardMeters - a.forwardMeters;
+        const alpha = span > 1e-3 ? Math.max(0, Math.min(1, (targetForward - a.forwardMeters) / span)) : 0;
+        lateralM = a.lateralMeters + alpha * (b.lateralMeters - a.lateralMeters);
+        break;
+      }
+    }
+    const pxOffset = (lateralM / LANE_WIDTH_METERS) * LANE_W0 * perspScale(t);
+    return OWN_X + Math.max(-90, Math.min(90, pxOffset));
+  }
   return OWN_X + curvePx * t * t;
 }
 
 function roadPoint(
   t: number,
   laneOffset: number,
-  curvePx: number
+  curvePx: number,
+  roadShape: RoadShapePoint[] = []
 ): { x: number; y: number; scale: number } {
   const s = perspScale(t);
-  const cx = roadCenterX(t, curvePx);
+  const cx = roadCenterX(t, curvePx, roadShape);
   const y = OWN_Y - t * ROAD_LEN;
   const x = cx + laneOffset * LANE_W0 * s;
   return { x, y, scale: s };
 }
 
-function buildCurvePath(laneOffset: number, curvePx: number, steps = 16): string {
+function buildCurvePath(laneOffset: number, curvePx: number, roadShape: RoadShapePoint[] = [], steps = 16): string {
   const pts: string[] = [];
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
-    const { x, y } = roadPoint(t, laneOffset, curvePx);
+    const { x, y } = roadPoint(t, laneOffset, curvePx, roadShape);
     pts.push(`${i === 0 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`);
   }
   return pts.join(' ');
 }
 
-function buildRoadPolygon(leftLane: number, rightLane: number, curvePx: number, steps = 16): string {
+function buildRoadPolygon(
+  leftLane: number,
+  rightLane: number,
+  curvePx: number,
+  roadShape: RoadShapePoint[] = [],
+  steps = 16
+): string {
   const leftPts: string[] = [];
   const rightPts: string[] = [];
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
-    const l = roadPoint(t, leftLane, curvePx);
-    const r = roadPoint(t, rightLane, curvePx);
+    const l = roadPoint(t, leftLane, curvePx, roadShape);
+    const r = roadPoint(t, rightLane, curvePx, roadShape);
     leftPts.push(`${i === 0 ? 'M' : 'L'}${l.x.toFixed(1)} ${l.y.toFixed(1)}`);
     rightPts.unshift(`L${r.x.toFixed(1)} ${r.y.toFixed(1)}`);
   }
@@ -309,6 +332,7 @@ function VehicleCarSvg({
 
 export function RoadRadarView({
   vehicles = [],
+  roadShape = [],
   hazards = [],
   effectiveHeading = null,
   headingSource = 'unknown',
@@ -319,6 +343,7 @@ export function RoadRadarView({
   clockOffsetMs = 0,
 }: {
   vehicles?: NearbyVehicle[];
+  roadShape?: RoadShapePoint[];
   hazards?: LiveHazard[];
   effectiveHeading?: number | null;
   headingSource?: HeadingSource;
@@ -341,7 +366,12 @@ export function RoadRadarView({
     const list: ProjectedVehicle[] = [];
     for (const v of extrapolatedVehicles) {
       const p = projectVehicleToRoad(v, effectiveHeading, ownAccuracy);
-      if (p && (showOncoming || p.direction !== 'oncoming')) list.push(p);
+      if (!p) continue;
+      const isOncoming = v.oncoming === true || p.direction === 'oncoming';
+      const finalProj: ProjectedVehicle = isOncoming
+        ? { ...p, direction: 'oncoming', laneOffset: Math.max(1.85, p.laneOffset) }
+        : p;
+      if (showOncoming || finalProj.direction !== 'oncoming') list.push(finalProj);
     }
     return list;
   }, [extrapolatedVehicles, effectiveHeading, ownAccuracy, showOncoming]);
@@ -548,13 +578,13 @@ export function RoadRadarView({
     }
   }
 
-  const mainRoadPath = buildRoadPolygon(-1.5, 1.5, smoothCurvePx);
-  const oppositeRoadPath = buildRoadPolygon(1.65, 2.55, smoothCurvePx);
-  const leftEdge = buildCurvePath(-1.5, smoothCurvePx);
-  const laneDivLeft = buildCurvePath(-0.5, smoothCurvePx);
-  const laneDivRight = buildCurvePath(0.5, smoothCurvePx);
-  const medianLine = buildCurvePath(1.57, smoothCurvePx);
-  const rightEdge = buildCurvePath(2.55, smoothCurvePx);
+  const mainRoadPath = buildRoadPolygon(-1.5, 1.5, smoothCurvePx, roadShape);
+  const oppositeRoadPath = buildRoadPolygon(1.65, 2.55, smoothCurvePx, roadShape);
+  const leftEdge = buildCurvePath(-1.5, smoothCurvePx, roadShape);
+  const laneDivLeft = buildCurvePath(-0.5, smoothCurvePx, roadShape);
+  const laneDivRight = buildCurvePath(0.5, smoothCurvePx, roadShape);
+  const medianLine = buildCurvePath(1.57, smoothCurvePx, roadShape);
+  const rightEdge = buildCurvePath(2.55, smoothCurvePx, roadShape);
 
   return (
     <View style={[s.container, { width: WIDTH, height: HEIGHT }]}>
@@ -624,8 +654,8 @@ export function RoadRadarView({
         {/* Distance rings & labels drawn behind vehicles */}
         {DISTANCE_RINGS.map(ring => {
           const t = scaleDistanceNorm(ring.meters);
-          const left = roadPoint(t, -1.5, smoothCurvePx);
-          const right = roadPoint(t, 2.55, smoothCurvePx);
+          const left = roadPoint(t, -1.5, smoothCurvePx, roadShape);
+          const right = roadPoint(t, 2.55, smoothCurvePx, roadShape);
           return (
             <G key={ring.meters}>
               <Line
@@ -656,7 +686,7 @@ export function RoadRadarView({
         {/* Map-pin hazard markers with subtle pulse */}
         {hazards.map(h => {
           const t = scaleDistanceNorm(h.distanceMeters);
-          const pt = roadPoint(t, 0, smoothCurvePx);
+          const pt = roadPoint(t, 0, smoothCurvePx, roadShape);
           return (
             <G key={h.id} transform={`translate(${pt.x.toFixed(1)}, ${pt.y.toFixed(1)})`}>
               {!lowPerf ? (
@@ -698,7 +728,7 @@ export function RoadRadarView({
             let scale: number;
             if (v.forwardMeters >= 0) {
               const t = scaleDistanceNorm(v.forwardMeters);
-              const pt = roadPoint(t, v.laneOffset, smoothCurvePx);
+              const pt = roadPoint(t, v.laneOffset, smoothCurvePx, roadShape);
               x = pt.x;
               y = Math.min(pt.y, OWN_Y - 58);
               scale = pt.scale;

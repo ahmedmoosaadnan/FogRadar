@@ -8,6 +8,15 @@ import {randomUUID} from 'node:crypto';
 import {bearingDegrees,headingDelta,isAhead,metersBetween} from './geo.js';
 import {issueToken,verifyToken} from './security.js';
 import {buildDeterministicInsights,normalizeRouteParam,requestLlmInsights,type InsightsResponse} from './insights.js';
+import {
+ computePairwiseRoadDistance,
+ detectDirectionWithHysteresis,
+ extractUpcomingRoadShape,
+ snapFixToSegments,
+ type MotorwaySegmentRecord,
+ type RoadDirection,
+ type RoadShapePoint,
+} from './roadMatching.js';
 
 const secret=(process.env.TOKEN_SECRET||process.env.SESSION_SECRET)??'';
 if(secret.length<32 || secret.startsWith('CHANGE_ME'))throw new Error('Set a random 32+ character TOKEN_SECRET (or SESSION_SECRET) environment variable');
@@ -37,7 +46,11 @@ const io=new SocketServer(app.server,{cors:{origin:corsOrigin},transports:['webs
 const routes=new Set(['M-1 Motorway','M-2 Motorway','M-3 Motorway','M-4 Motorway','M-5 Motorway','M-9 Motorway']);
 const hazardTypes=new Set(['Stopped traffic','Accident','Heavy fog','Vehicle breakdown']);
 const GEO_KEY='fog:live:geo',ACTIVE_KEY='fog:live:active';
-type Fix={latitude:number;longitude:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;timestamp:number;fixTime:number;route:string;seenAt:number};
+type Fix={
+ latitude:number;longitude:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;
+ timestamp:number;fixTime:number;route:string;seenAt:number;
+ matched?:boolean;segmentId?:number|null;chainageMeters?:number|null;offsetMeters?:number|null;roadDirection?:RoadDirection;
+};
 type AuthedSocket=Socket & {data:{vehicleId:string;lastReportAt?:number;lastSnapshotAt?:number;route?:string}};
 const sessionLimit=new Map<string,{count:number;until:number}>();
 type CachedInsights={response:InsightsResponse;liveVehicles:number;hazardSig:string;isLlm:boolean};
@@ -183,7 +196,90 @@ async function putFix(id:string,fix:Fix){
 async function removeFix(id:string){
  await redis.multi().zRem(GEO_KEY,id).zRem(ACTIVE_KEY,id).del(`fog:live:vehicle:${id}`).exec();
 }
-type SnapshotVehicle={id:string;distanceMeters:number;bearing:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;ageMs:number;fixTime:number};
+const segmentCache=new Map<number,MotorwaySegmentRecord>();
+const vehicleSegmentCache=new Map<string,number>();
+let motorwayTableAvailable=true;
+
+async function matchFixToMotorway(vehicleId:string,fix:Fix,previous:Fix|null,routeOverride=false):Promise<Fix>{
+ if(fix.accuracyMeters>50 || !motorwayTableAvailable){
+  return {...fix,matched:false,segmentId:null,chainageMeters:null,offsetMeters:null,roadDirection:'unknown'};
+ }
+ const cachedSegId=vehicleSegmentCache.get(vehicleId);
+ if(cachedSegId!==undefined){
+  const cachedSeg=segmentCache.get(cachedSegId);
+  if(cachedSeg){
+   const localSnap=snapFixToSegments(fix.latitude,fix.longitude,fix.accuracyMeters,[cachedSeg],60);
+   if(localSnap.matched){
+    const dir=detectDirectionWithHysteresis(
+     previous?.roadDirection??'unknown',
+     previous?.segmentId===cachedSeg.id?previous?.chainageMeters??null:null,
+     localSnap.chainageMeters,
+     8
+    );
+    return {
+     ...fix,
+     route:routeOverride?fix.route:localSnap.route,
+     matched:true,
+     segmentId:cachedSeg.id,
+     chainageMeters:localSnap.chainageMeters,
+     offsetMeters:localSnap.offsetMeters,
+     roadDirection:dir,
+    };
+   }
+  }
+ }
+
+ try{
+  const res=await pool.query<{id:number;route:string;direction:string;geojson:string;length_m:number}>(
+   `SELECT id,route,direction,ST_AsGeoJSON(geometry) AS geojson,length_m
+    FROM motorway_segments
+    WHERE ST_DWithin(geometry::geography,ST_SetSRID(ST_MakePoint($1,$2),4326)::geography,60)
+    ORDER BY ST_Distance(geometry::geography,ST_SetSRID(ST_MakePoint($1,$2),4326)::geography)
+    LIMIT 1`,
+   [fix.longitude,fix.latitude]
+  );
+  if(!res.rows.length){
+   vehicleSegmentCache.delete(vehicleId);
+   return {...fix,matched:false,segmentId:null,chainageMeters:null,offsetMeters:null,roadDirection:'unknown'};
+  }
+  const row=res.rows[0];
+  const parsed=JSON.parse(row.geojson) as {coordinates?:Array<[number,number]>};
+  const seg:MotorwaySegmentRecord={
+   id:Number(row.id),
+   route:row.route,
+   direction:row.direction,
+   coords:Array.isArray(parsed.coordinates)?parsed.coordinates:[],
+   lengthMeters:Number(row.length_m),
+  };
+  segmentCache.set(seg.id,seg);
+  vehicleSegmentCache.set(vehicleId,seg.id);
+  const snap=snapFixToSegments(fix.latitude,fix.longitude,fix.accuracyMeters,[seg],60);
+  if(!snap.matched){
+   return {...fix,matched:false,segmentId:null,chainageMeters:null,offsetMeters:null,roadDirection:'unknown'};
+  }
+  const dir=detectDirectionWithHysteresis(
+   previous?.roadDirection??'unknown',
+   previous?.segmentId===seg.id?previous?.chainageMeters??null:null,
+   snap.chainageMeters,
+   8
+  );
+  return {
+   ...fix,
+   route:routeOverride?fix.route:snap.route,
+   matched:true,
+   segmentId:seg.id,
+   chainageMeters:snap.chainageMeters,
+   offsetMeters:snap.offsetMeters,
+   roadDirection:dir,
+  };
+ }catch(e:unknown){
+  const msg=e instanceof Error?e.message:'';
+  if(/motorway_segments/i.test(msg))motorwayTableAvailable=false;
+  return {...fix,matched:false,segmentId:null,chainageMeters:null,offsetMeters:null,roadDirection:'unknown'};
+ }
+}
+
+type SnapshotVehicle={id:string;distanceMeters:number;bearing:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;ageMs:number;fixTime:number;oncoming?:boolean};
 function filterNearbyFromPool(id:string,own:Fix,candidates:Array<{id:string;fix:Fix}>):SnapshotVehicle[]{
  const now=Date.now();
  const visible:SnapshotVehicle[]=[];
@@ -191,17 +287,18 @@ function filterNearbyFromPool(id:string,own:Fix,candidates:Array<{id:string;fix:
   if(item.id===id)continue;
   const age=now-item.fix.seenAt;
   if(age>12_000 || item.fix.route!==own.route)continue;
-  const distance=metersBetween(own,item.fix);
-  if(distance>1000)continue;
+  const pair=computePairwiseRoadDistance(own,item.fix);
+  if(pair.distanceMeters>1000)continue;
   visible.push({
    id:item.id,
-   distanceMeters:Math.round(distance),
+   distanceMeters:Math.round(pair.distanceMeters),
    bearing:Math.round(bearingDegrees(own,item.fix)),
    speedKmh:item.fix.speedKmh,
    heading:item.fix.heading,
    accuracyMeters:item.fix.accuracyMeters,
    ageMs:age,
    fixTime:item.fix.fixTime,
+   ...(pair.oncoming?{oncoming:true}:{}),
   });
  }
  return visible.sort((a,b)=>a.distanceMeters-b.distanceMeters).slice(0,80);
@@ -283,10 +380,17 @@ async function snapshot(socket:AuthedSocket,preloadedOwn?:Fix,preloadedPool?:Arr
  }
  const vehicles=preloadedPool?filterNearbyFromPool(socket.data.vehicleId,own,preloadedPool):await nearby(socket.data.vehicleId,own);
  const hazards=hazardsAhead(own);
+ let roadShape:RoadShapePoint[]=[];
+ if(own.matched && own.segmentId!=null && own.chainageMeters!=null && own.roadDirection && own.roadDirection!=='unknown'){
+  const seg=segmentCache.get(own.segmentId);
+  if(seg){
+   roadShape=extractUpcomingRoadShape(own.latitude,own.longitude,own.heading,seg.coords,own.chainageMeters,own.roadDirection,1000,100);
+  }
+ }
  if(socket.connected){
   const emitTime=Date.now();
   socket.data.lastSnapshotAt=emitTime;
-  socket.volatile.emit('radar:snapshot',{vehicles,serverTime:emitTime});
+  socket.volatile.emit('radar:snapshot',{vehicles,roadShape,serverTime:emitTime});
   socket.emit('hazards:snapshot',{hazards,serverTime:emitTime});
  }
 }
@@ -367,30 +471,32 @@ io.on('connection',base=>{
     app.log.debug({vehicleId,route:fix.route,accepted:false,reason:'GPS jump rejected'},'telemetry:update');
     ack?.({ok:false,error:'GPS jump rejected'});return;
    }
-   await putFix(vehicleId,fix);
+   const routeOverride=Boolean(raw&&typeof raw==='object'&&(raw as {routeOverride?:unknown}).routeOverride===true);
+   const matchedFix=await matchFixToMotorway(vehicleId,fix,previous,routeOverride);
+   await putFix(vehicleId,matchedFix);
    const prevRoute=socket.data.route;
-   socket.data.route=fix.route;
+   socket.data.route=matchedFix.route;
    const receivedAt=Date.now();
    telemetrySampleCount+=1;
    if(telemetrySampleCount%20===1){
     const sentAtRaw=raw&&typeof raw==='object'?(raw as {sentAt?:unknown}).sentAt:undefined;
-    const sentAt=typeof sentAtRaw==='number'&&Number.isFinite(sentAtRaw)?sentAtRaw:fix.timestamp;
-    app.log.info({vehicleId,route:fix.route,uploadLatencyMs:receivedAt-sentAt,fixToReceiveMs:receivedAt-fix.fixTime},'telemetry:update latency sample');
+    const sentAt=typeof sentAtRaw==='number'&&Number.isFinite(sentAtRaw)?sentAtRaw:matchedFix.timestamp;
+    app.log.info({vehicleId,route:matchedFix.route,matched:Boolean(matchedFix.matched),uploadLatencyMs:receivedAt-sentAt,fixToReceiveMs:receivedAt-matchedFix.fixTime},'telemetry:update latency sample');
    }
    ack?.({ok:true,serverTime:receivedAt});
-   await snapshot(socket,fix);
-   if(prevRoute!==fix.route){
-    const insightsPayload=await getOrComputeInsights(fix.route);
+   await snapshot(socket,matchedFix);
+   if(prevRoute!==matchedFix.route){
+    const insightsPayload=await getOrComputeInsights(matchedFix.route);
     if(socket.connected)socket.emit('insights:update',insightsPayload);
    }else{
-    const cachedInsights=insightsCache.get(fix.route);
+    const cachedInsights=insightsCache.get(matchedFix.route);
     if(cachedInsights){
      let routeActiveCount=0;
      for(const s of io.sockets.sockets.values()){
-      if((s as AuthedSocket).data.route===fix.route)routeActiveCount+=1;
+      if((s as AuthedSocket).data.route===matchedFix.route)routeActiveCount+=1;
      }
      if(Math.abs(routeActiveCount-cachedInsights.liveVehicles)>1){
-      void invalidateAndPushInsights(fix.route);
+      void invalidateAndPushInsights(matchedFix.route);
      }
     }
    }

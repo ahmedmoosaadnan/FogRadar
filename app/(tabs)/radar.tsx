@@ -42,6 +42,7 @@ export default function Radar() {
   const {
     status,
     vehicles,
+    roadShape,
     updatedAt,
     error,
     hazards,
@@ -393,6 +394,7 @@ export default function Radar() {
 
         <RoadRadarView
           vehicles={liveVehicles}
+          roadShape={roadShape}
           hazards={liveHazards}
           effectiveHeading={headingState.effectiveHeading}
           headingSource={headingState.source}

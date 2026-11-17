@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,16 +11,9 @@ if (!rawDbUrl) {
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const candidates = [
-  resolve(__dirname, '../migrations/001_init.sql'),
-  resolve(__dirname, '../sql/001_init.sql'),
-];
-const sqlPath = candidates.find(p => existsSync(p));
-if (!sqlPath) {
-  throw new Error('Migration file 001_init.sql not found in migrations/ or sql/');
-}
+const migrationsDir = resolve(__dirname, '../migrations');
+const fallbackSql = resolve(__dirname, '../sql/001_init.sql');
 
-const sql = await readFile(sqlPath, 'utf8');
 const isLocalDb = /@(localhost|127\.0\.0\.1|db)(:|\/|$)/i.test(rawDbUrl) || /sslmode=disable/i.test(rawDbUrl);
 const dbUrl = /sslmode=/i.test(rawDbUrl) && !/uselibpqcompat=/i.test(rawDbUrl)
   ? `${rawDbUrl}${rawDbUrl.includes('?') ? '&' : '?'}uselibpqcompat=true`
@@ -33,8 +26,21 @@ const pool = new pg.Pool({
 
 try {
   await pool.query('CREATE EXTENSION IF NOT EXISTS postgis;');
-  await pool.query(sql);
-  console.log(`Migration applied successfully from ${sqlPath}`);
+  if (existsSync(migrationsDir)) {
+    const files = (await readdir(migrationsDir)).filter(f => f.endsWith('.sql')).sort();
+    for (const file of files) {
+      const fullPath = resolve(migrationsDir, file);
+      const sql = await readFile(fullPath, 'utf8');
+      await pool.query(sql);
+      console.log(`Migration applied: ${file}`);
+    }
+  } else if (existsSync(fallbackSql)) {
+    const sql = await readFile(fallbackSql, 'utf8');
+    await pool.query(sql);
+    console.log(`Migration applied from ${fallbackSql}`);
+  } else {
+    throw new Error('No migration SQL files found');
+  }
 } finally {
   await pool.end();
 }
