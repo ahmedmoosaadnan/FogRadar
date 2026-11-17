@@ -119,6 +119,11 @@ export function ProximityLegend() {
   );
 }
 
+export function formatVehicleDistance(distanceMeters: number): string {
+  const rounded = Math.round(distanceMeters);
+  return rounded < 10 ? '< 10 m' : `${rounded} m`;
+}
+
 function VehicleCarSvg({
   x,
   y,
@@ -198,7 +203,7 @@ function VehicleCarSvg({
         fontFamily={SVG_FONT}
         textAnchor="middle"
       >
-        {Math.round(proj.distanceMeters)} m
+        {formatVehicleDistance(proj.distanceMeters)}
       </SvgText>
       <SvgText
         x={0}
@@ -222,6 +227,7 @@ export function RoadRadarView({
   headingSource = 'unknown',
   ownAccuracy = null,
   yawRateDegPerSec = 0,
+  showOncoming = true,
 }: {
   vehicles?: NearbyVehicle[];
   hazards?: LiveHazard[];
@@ -229,16 +235,17 @@ export function RoadRadarView({
   headingSource?: HeadingSource;
   ownAccuracy?: number | null;
   yawRateDegPerSec?: number;
+  showOncoming?: boolean;
 }) {
   const projected = useMemo(() => {
     if (effectiveHeading === null) return [];
     const list: ProjectedVehicle[] = [];
     for (const v of vehicles) {
       const p = projectVehicleToRoad(v, effectiveHeading, ownAccuracy);
-      if (p) list.push(p);
+      if (p && (showOncoming || p.direction !== 'oncoming')) list.push(p);
     }
     return list;
-  }, [vehicles, effectiveHeading, ownAccuracy]);
+  }, [vehicles, effectiveHeading, ownAccuracy, showOncoming]);
 
   const animRef = useRef<AnimState>({ from: {}, to: {}, startedAt: Date.now() });
   const currentRef = useRef<Record<string, { forwardMeters: number; laneOffset: number; distanceMeters: number }>>({});
@@ -320,6 +327,7 @@ export function RoadRadarView({
             DISTANCE-ONLY · DIRECTION UNAVAILABLE
           </SvgText>
 
+          {/* Distance rings and labels drawn first (behind YOU and vehicle dots/pills) */}
           {DISTANCE_RINGS.map(ring => {
             const r = scaleDistanceNorm(ring.meters) * maxR;
             return (
@@ -355,19 +363,24 @@ export function RoadRadarView({
             YOU
           </SvgText>
 
-          {/* Plot each vehicle as a dot on its real-distance ring, spread evenly */}
+          {/* Plot each vehicle just outside YOU (minR=46), offset from top-center ring labels, fanned out if overlapping */}
           {vehicles.map((v, idx) => {
-            const r = Math.max(36, scaleDistanceNorm(v.distanceMeters) * maxR);
-            const angle = (idx * 2 * Math.PI) / Math.max(1, vehicles.length);
+            const baseR = Math.max(46, scaleDistanceNorm(v.distanceMeters) * maxR);
+            const count = Math.max(1, vehicles.length);
+            // Start at 35° so vehicles avoid the 0° top-center ring label corridor ("100 m")
+            const angle = (35 * Math.PI) / 180 + (idx * 2 * Math.PI) / count;
+            // Subtle radial stagger if many vehicles share a similar ring
+            const r = baseR + (count > 4 ? (idx % 2 === 0 ? 0 : 12) : 0);
             const vx = center + r * Math.sin(angle);
             const vy = cy - r * Math.cos(angle);
+            const pillOffsetY = Math.cos(angle) > 0.55 ? 14 : 11;
             const style = ZONE_STYLE[proximityColor(v.distanceMeters, ownAccuracy, v.accuracyMeters)];
             return (
               <G key={v.id} transform={`translate(${vx.toFixed(1)}, ${vy.toFixed(1)})`}>
                 <Circle cx={0} cy={0} r={8.5} fill={style.dot} stroke="#070D14" strokeWidth={2} />
-                <Rect x={-26} y={11} width={52} height={18} rx={6} fill="#070D14" stroke={style.stroke} strokeWidth={1} />
-                <SvgText x={0} y={23} fill="#FFFFFF" fontSize={10} fontWeight="900" fontFamily={SVG_FONT} textAnchor="middle">
-                  {v.distanceMeters} m
+                <Rect x={-27} y={pillOffsetY} width={54} height={18} rx={6} fill="#070D14" stroke={style.stroke} strokeWidth={1} />
+                <SvgText x={0} y={pillOffsetY + 12.5} fill="#FFFFFF" fontSize={10} fontWeight="900" fontFamily={SVG_FONT} textAnchor="middle">
+                  {formatVehicleDistance(v.distanceMeters)}
                 </SvgText>
               </G>
             );
@@ -491,19 +504,42 @@ export function RoadRadarView({
           );
         })}
 
-        {/* Nearby vehicles ahead and behind */}
-        {animatedVehicles.map(v => {
-          const color = proximityColor(v.distanceMeters, ownAccuracy, v.accuracyMeters);
-          if (v.forwardMeters >= 0) {
-            const t = scaleDistanceNorm(v.forwardMeters);
-            const pt = roadPoint(t, v.laneOffset, smoothCurvePx);
-            return <VehicleCarSvg key={v.id} x={pt.x} y={pt.y} scale={pt.scale} proj={v} color={color} />;
+        {/* Nearby vehicles ahead and behind (clamped outside YOU, fanned out when overlapping) */}
+        {(() => {
+          const placed: Array<{ x: number; y: number; scale: number; proj: ProjectedVehicle; color: ProximityColor }> = [];
+          for (const v of animatedVehicles) {
+            const color = proximityColor(v.distanceMeters, ownAccuracy, v.accuracyMeters);
+            let x: number;
+            let y: number;
+            let scale: number;
+            if (v.forwardMeters >= 0) {
+              const t = scaleDistanceNorm(v.forwardMeters);
+              const pt = roadPoint(t, v.laneOffset, smoothCurvePx);
+              x = pt.x;
+              // Keep ahead vehicles and their pills clear above YOU (OWN_Y - 58)
+              y = Math.min(pt.y, OWN_Y - 58);
+              scale = pt.scale;
+            } else {
+              const rearRatio = Math.min(1, Math.abs(v.forwardMeters) / 150);
+              y = Math.max(OWN_Y + 46, OWN_Y + 46 + rearRatio * (HEIGHT - OWN_Y - 74));
+              x = OWN_X + Math.max(-1.2, Math.min(1.2, v.laneOffset)) * LANE_W0;
+              scale = 0.95;
+            }
+            // Fan out slightly if overlapping an already-placed vehicle
+            let fanStep = 0;
+            while (placed.some(p => Math.abs(p.x - x) < 42 && Math.abs(p.y - y) < 38) && fanStep < 6) {
+              fanStep += 1;
+              const dir = fanStep % 2 === 1 ? 1 : -1;
+              const mag = Math.ceil(fanStep / 2);
+              x += dir * mag * 34;
+              y -= mag * 10;
+            }
+            placed.push({ x, y, scale, proj: v, color });
           }
-          const rearRatio = Math.min(1, Math.abs(v.forwardMeters) / 150);
-          const ry = OWN_Y + 34 + rearRatio * (HEIGHT - OWN_Y - 62);
-          const rx = OWN_X + Math.max(-1.2, Math.min(1.2, v.laneOffset)) * LANE_W0;
-          return <VehicleCarSvg key={v.id} x={rx} y={ry} scale={0.95} proj={v} color={color} />;
-        })}
+          return placed.map(item => (
+            <VehicleCarSvg key={item.proj.id} x={item.x} y={item.y} scale={item.scale} proj={item.proj} color={item.color} />
+          ));
+        })()}
 
         {/* Own car at bottom center with subtle glow */}
         <G transform={`translate(${OWN_X}, ${OWN_Y})`}>

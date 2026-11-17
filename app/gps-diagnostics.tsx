@@ -24,7 +24,7 @@ export default function GPSDiagnostics() {
     <ScrollView contentContainerStyle={s.content}>
       <Pressable style={s.back} onPress={() => router.back()}><Icon name="arrow" size={20} color={C.forest} /><Text style={s.backText}>Back</Text></Pressable>
       <Text style={s.title}>GPS Diagnostics</Text>
-      <Text style={s.sub}>Verify real iPhone / Android location data before cloud integration.</Text>
+      <Text style={s.sub}>Inspect live device GNSS speed, accuracy and fix latency.</Text>
       <View style={s.badges}>
         <Pill label={gpsState.toUpperCase()} tone={isFresh ? 'green' : 'amber'} />
         <Pill label={isFresh ? `GPS ${quality.toUpperCase()}` : 'NO FRESH GPS FIX'} tone={isFresh && quality === 'good' ? 'green' : 'amber'} />
@@ -45,12 +45,12 @@ export default function GPSDiagnostics() {
       </Card>
       {error ? <Text style={s.error}>GPS error: {error}</Text> : null}
       <Pressable style={[s.button, active && s.stopButton]} onPress={() => { if (active) { stopJourney(); router.push('/trip-summary'); } else void startJourney(); }}>
-        <Text style={s.buttonText}>{active ? 'End Journey / Stop GPS' : gpsState === 'requesting' ? 'Requesting permission…' : 'Start GPS Test'}</Text>
+        <Text style={s.buttonText}>{active ? 'End Journey / Stop GPS' : gpsState === 'requesting' ? 'Requesting permission…' : 'Start GPS Tracking'}</Text>
       </Pressable>
-      {active ? <Pressable style={[s.button,{backgroundColor:C.forest}]} onPress={()=>void refreshLocation()}><Text style={s.buttonText}>Request fresh GPS fix (iPhone / Android)</Text></Pressable> : null}
+      {active ? <Pressable style={[s.button,{backgroundColor:C.forest}]} onPress={()=>void refreshLocation()}><Text style={s.buttonText}>Refresh GPS Fix</Text></Pressable> : null}
       <View style={s.note}>
         <Icon name="alert" size={18} color="#805D00" />
-        <Text style={s.noteText}>TEST ONLY — This screen does not detect road hazards. Distance is estimated and speed updates depend on the operating system. Location accuracy does not guarantee lane detection. Keep app foregrounded; Expo Go cannot validate background tracking. Test safely while stationary or as a passenger.</Text>
+        <Text style={s.noteText}>Keep FogRadar in the foreground during active journeys for continuous GNSS updates.</Text>
       </View>
     </ScrollView>
   </SafeAreaView>;

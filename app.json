@@ -3,7 +3,7 @@
     "name": "FogRadar",
     "slug": "fogradar",
     "scheme": "fogradar",
-    "version": "0.5.0",
+    "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "icon": "./assets/icon.png",
@@ -11,7 +11,7 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.fogradar.mobile",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "FogRadar uses your precise location during an active test journey to show your speed and nearby connected test phones through your chosen FogRadar server. Other traffic is not detected."
+        "NSLocationWhenInUseUsageDescription": "FogRadar uses your precise location during an active journey to display nearby connected vehicles and motorway hazard advisories."
       }
     },
     "android": {
@@ -26,7 +26,7 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Allow FogRadar to use precise location during an active test journey to send GPS data to the FogRadar server and show connected test phones nearby.",
+          "locationWhenInUsePermission": "Allow FogRadar to access your precise location during an active journey to share live telemetry and show nearby vehicles.",
           "isIosBackgroundLocationEnabled": false,
           "isAndroidBackgroundLocationEnabled": false,
           "isAndroidForegroundServiceEnabled": false

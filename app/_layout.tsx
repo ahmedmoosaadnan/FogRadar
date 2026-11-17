@@ -11,7 +11,7 @@ export default function RootLayout() {
     <Stack.Screen name="offline" />
     <Stack.Screen name="gps-diagnostics" />
     <Stack.Screen name="trip-summary" />
-    <Stack.Screen name="report-hazard" />
+    <Stack.Screen name="trip-history" />
     <Stack.Screen name="server-connection" />
   </Stack></CloudProvider></JourneyProvider></SafeAreaProvider>;
 }

@@ -5,6 +5,7 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
 import {
+  formatVehicleDistance,
   RoadRadarView,
   ProximityLegend,
   proximityColor,
@@ -23,7 +24,7 @@ const TAB_BAR_HEIGHT = 66;
 
 export default function Radar() {
   const insets = useSafeAreaInsets();
-  const { gpsState, location, startedAt, refreshLocation } = useJourney();
+  const { gpsState, location, startedAt, refreshLocation, showOncoming } = useJourney();
   const {
     status,
     vehicles,
@@ -219,6 +220,7 @@ export default function Radar() {
           headingSource={headingState.source}
           ownAccuracy={ownAccuracy}
           yawRateDegPerSec={headingState.yawRateDegPerSec}
+          showOncoming={showOncoming}
         />
         <ProximityLegend />
 
@@ -263,7 +265,7 @@ export default function Radar() {
                 <View key={v.id} style={s.row}>
                   <View style={[s.dot, { backgroundColor: color }]} />
                   <Text style={s.rowName}>Vehicle {index + 1}</Text>
-                  <Text style={s.rowDistance}>{v.distanceMeters} m</Text>
+                  <Text style={s.rowDistance}>{formatVehicleDistance(v.distanceMeters)}</Text>
                   <Text style={s.rowMeta}>
                     {v.speedKmh ?? '—'} km/h · ±{v.accuracyMeters} m · {(v.ageMs / 1000).toFixed(1)}s
                   </Text>
