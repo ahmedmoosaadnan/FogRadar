@@ -23,6 +23,11 @@ export type LiveHazard = {
   expiresAt: number;
   status: string;
 };
+export type RoadInsights = {
+  summary_en: string;
+  summary_ur: string;
+  generatedAt: number;
+};
 type CloudStatus = 'not-configured' | 'idle' | 'connecting' | 'online' | 'offline';
 type TelemetryAck = { ok: boolean; error?: string; serverTime?: number };
 type ProbeResult = { ok: boolean; message: string; latencyMs: number | null };
@@ -31,6 +36,7 @@ type CloudState = {
   error: string | null;
   vehicles: NearbyVehicle[];
   hazards: LiveHazard[];
+  insights: RoadInsights | null;
   updatedAt: number | null;
   lastUploadAt: number | null;
   lastUploadError: string | null;
@@ -56,6 +62,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [vehicles, setVehicles] = useState<NearbyVehicle[]>([]);
   const [hazards, setHazards] = useState<LiveHazard[]>([]);
+  const [insights, setInsights] = useState<RoadInsights | null>(null);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const [lastUploadAt, setLastUploadAt] = useState<number | null>(null);
   const [lastUploadError, setLastUploadError] = useState<string | null>(null);
@@ -193,6 +200,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
       socketRef.current = null;
       setVehicles([]);
       setHazards([]);
+      setInsights(null);
       setUpdatedAt(null);
       setLastUploadAt(null);
       setSnapshotReceivedCount(0);
@@ -269,6 +277,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
             setError(`Disconnected: ${reason}`);
             setVehicles([]);
             setHazards([]);
+            setInsights(null);
             setUpdatedAt(null);
             setSnapshotReceivedCount(0);
           }
@@ -296,6 +305,21 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
           setSnapshotReceivedCount(rawList.length);
           setVehicles(valid);
           setUpdatedAt(clientNow);
+        });
+        sock.on('insights:update', (payload: Partial<RoadInsights>) => {
+          if (cancelled) return;
+          if (
+            typeof payload?.summary_en === 'string' &&
+            typeof payload?.summary_ur === 'string' &&
+            typeof payload?.generatedAt === 'number'
+          ) {
+            // Informational display only: never triggers voice or vibration alerts.
+            setInsights({
+              summary_en: payload.summary_en,
+              summary_ur: payload.summary_ur,
+              generatedAt: payload.generatedAt,
+            });
+          }
         });
         sock.on('hazards:snapshot', (payload: { hazards?: LiveHazard[] }) => {
           if (cancelled) return;
@@ -354,9 +378,15 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
   }, [hydrated, startedAt, gpsState, apiUrl, sendTelemetry]);
 
   useEffect(() => {
+    setInsights(null);
     if (status !== 'online' || !location) return;
     sendTelemetry(location);
-  }, [location, status, route, sendTelemetry]);
+  }, [route]);
+
+  useEffect(() => {
+    if (status !== 'online' || !location) return;
+    sendTelemetry(location);
+  }, [location, status, sendTelemetry]);
 
   useEffect(() => {
     if (status !== 'online' || !startedAt || gpsState !== 'tracking') return;
@@ -372,6 +402,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
       error,
       vehicles,
       hazards,
+      insights,
       updatedAt,
       lastUploadAt,
       lastUploadError,
@@ -388,6 +419,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
       error,
       vehicles,
       hazards,
+      insights,
       updatedAt,
       lastUploadAt,
       lastUploadError,

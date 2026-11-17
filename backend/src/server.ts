@@ -40,50 +40,104 @@ const GEO_KEY='fog:live:geo',ACTIVE_KEY='fog:live:active';
 type Fix={latitude:number;longitude:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;timestamp:number;fixTime:number;route:string;seenAt:number};
 type AuthedSocket=Socket & {data:{vehicleId:string;lastReportAt?:number;lastSnapshotAt?:number;route?:string}};
 const sessionLimit=new Map<string,{count:number;until:number}>();
-const insightsCache=new Map<string,InsightsResponse>();
+type CachedInsights={response:InsightsResponse;liveVehicles:number;hazardSig:string;isLlm:boolean};
+const insightsCache=new Map<string,CachedInsights>();
+const insightsInFlight=new Set<string>();
+
+function pushInsightsToRoute(route:string,payload:InsightsResponse){
+ for(const base of io.sockets.sockets.values()){
+  const s=base as AuthedSocket;
+  if(s.connected && s.data.route===route){
+   s.emit('insights:update',payload);
+  }
+ }
+}
+
+async function gatherRouteInsights(route:string,now=Date.now()){
+ const [dbRes,activeIds]=await Promise.all([
+  pool.query<{id:string;type:string;latitude:number;longitude:number;report_count:number;created_at:Date}>(
+   `SELECT id,type,latitude,longitude,report_count,created_at FROM hazards
+    WHERE route=$1 AND status='corroborated' AND expires_at>NOW()
+    ORDER BY created_at DESC LIMIT 20`,
+   [route]
+  ),
+  redis.zRangeByScore(ACTIVE_KEY,now-12_000,'+inf',{LIMIT:{offset:0,count:200}}),
+ ]);
+ let liveVehicles=0;
+ if(activeIds.length){
+  const records=await redis.mGet(activeIds.map(id=>`fog:live:vehicle:${id}`));
+  for(const raw of records){
+   if(!raw)continue;
+   try{
+    const fix=JSON.parse(raw) as Fix;
+    if(now-fix.seenAt<=12_000 && fix.route===route)liveVehicles+=1;
+   }catch{ /* ignore malformed ephemeral entries */ }
+  }
+ }
+ const hazards=dbRes.rows.map(r=>({
+  type:r.type,
+  latitude:Number(r.latitude),
+  longitude:Number(r.longitude),
+  ageMinutes:Math.max(1,Math.round((now-new Date(r.created_at).getTime())/60_000)),
+  reportCount:Number(r.report_count),
+ }));
+ const hazardSig=dbRes.rows.map(r=>`${r.id}:${r.report_count}`).join('|');
+ return {liveVehicles,hazards,hazardSig};
+}
+
+function triggerLlmRefresh(
+ route:string,
+ data:{route:string;liveVehicles:number;hazards:Array<{type:string;latitude:number;longitude:number;ageMinutes:number;reportCount:number}>},
+ hazardSig:string
+){
+ if(insightsInFlight.has(route))return;
+ if((data.liveVehicles===0 && data.hazards.length===0)||!process.env.LLM_API_KEY||!process.env.LLM_MODEL)return;
+ insightsInFlight.add(route);
+ void requestLlmInsights(data,process.env.LLM_API_KEY,process.env.LLM_MODEL,Date.now())
+  .then(llmRes=>{
+   const latest=insightsCache.get(route);
+   if(latest && latest.hazardSig===hazardSig && Math.abs(latest.liveVehicles-data.liveVehicles)<=1){
+    insightsCache.set(route,{response:llmRes,liveVehicles:data.liveVehicles,hazardSig,isLlm:true});
+    pushInsightsToRoute(route,llmRes);
+   }
+  })
+  .catch(()=>{ /* deterministic summary is already cached and served */ })
+  .finally(()=>{insightsInFlight.delete(route);});
+}
+
+async function getOrComputeInsights(route:string):Promise<InsightsResponse>{
+ const now=Date.now();
+ try{
+  const {liveVehicles,hazards,hazardSig}=await gatherRouteInsights(route,now);
+  const cached=insightsCache.get(route);
+  const valid=
+   cached &&
+   now-cached.response.generatedAt<10_000 &&
+   Math.abs(liveVehicles-cached.liveVehicles)<=1 &&
+   cached.hazardSig===hazardSig;
+  if(valid)return cached.response;
+
+  const deterministic=buildDeterministicInsights({route,liveVehicles,hazards},now);
+  insightsCache.set(route,{response:deterministic,liveVehicles,hazardSig,isLlm:false});
+  triggerLlmRefresh(route,{route,liveVehicles,hazards},hazardSig);
+  return deterministic;
+ }catch(e){
+  app.log.warn(e,'Insights generation fell back to deterministic template');
+  return buildDeterministicInsights({route,liveVehicles:0,hazards:[]},now);
+ }
+}
+
+async function invalidateAndPushInsights(route:string){
+ insightsCache.delete(route);
+ const payload=await getOrComputeInsights(route);
+ pushInsightsToRoute(route,payload);
+}
+
 app.get('/health',async()=>({ok:true,service:'FogRadar MVP',phase:'FIELD-TEST-ONLY',time:Date.now()}));
 app.get('/v1/insights',async(req)=>{
  const query=(req.query&&typeof req.query==='object'?req.query:{}) as {route?:unknown};
  const route=normalizeRouteParam(query.route);
- const now=Date.now();
- const cached=insightsCache.get(route);
- if(cached && now-cached.generatedAt<60_000)return cached;
- try{
-  const [dbRes,activeIds]=await Promise.all([
-   pool.query<{type:string;latitude:number;longitude:number;report_count:number;created_at:Date}>(
-    `SELECT type,latitude,longitude,report_count,created_at FROM hazards
-     WHERE route=$1 AND status='corroborated' AND expires_at>NOW()
-     ORDER BY created_at DESC LIMIT 20`,
-    [route]
-   ),
-   redis.zRangeByScore(ACTIVE_KEY,now-12_000,'+inf',{LIMIT:{offset:0,count:200}}),
-  ]);
-  let liveVehicles=0;
-  if(activeIds.length){
-   const records=await redis.mGet(activeIds.map(id=>`fog:live:vehicle:${id}`));
-   for(const raw of records){
-    if(!raw)continue;
-    try{
-     const fix=JSON.parse(raw) as Fix;
-     if(now-fix.seenAt<=12_000 && fix.route===route)liveVehicles+=1;
-    }catch{ /* ignore malformed ephemeral entries */ }
-   }
-  }
-  const hazards=dbRes.rows.map(r=>({
-   type:r.type,
-   latitude:Number(r.latitude),
-   longitude:Number(r.longitude),
-   ageMinutes:Math.max(1,Math.round((now-new Date(r.created_at).getTime())/60_000)),
-   reportCount:Number(r.report_count),
-  }));
-  const result=await requestLlmInsights({route,liveVehicles,hazards},process.env.LLM_API_KEY,process.env.LLM_MODEL,now);
-  insightsCache.set(route,result);
-  return result;
- }catch(e){
-  app.log.warn(e,'Insights generation fell back to deterministic template');
-  const fallback=buildDeterministicInsights({route,liveVehicles:0,hazards:[]},now);
-  return fallback;
- }
+ return getOrComputeInsights(route);
 });
 app.post('/v1/session',async(req,reply)=>{
  const ip=req.ip,now=Date.now(),entry=sessionLimit.get(ip);
@@ -173,6 +227,7 @@ async function nearby(id:string,own:Fix){
 type HazardRow={id:string;type:string;route:string;latitude:number;longitude:number;heading:number;report_count:number;expires_at:Date};
 type CachedHazard={id:string;type:string;route:string;latitude:number;longitude:number;heading:number;report_count:number;expiresAtMs:number};
 const hazardCache=new Map<string,CachedHazard[]>();
+const hazardSignatures=new Map<string,string>();
 async function refreshHazardCache(){
  try{
   const rows=await pool.query<HazardRow>(
@@ -189,8 +244,18 @@ async function refreshHazardCache(){
    });
    next.set(r.route,list);
   }
+  const changedRoutes=new Set<string>();
+  for(const r of routes){
+   const nextSig=(next.get(r)??[]).map(h=>`${h.id}:${h.report_count}`).join('|');
+   const prevSig=hazardSignatures.get(r)??'';
+   if(nextSig!==prevSig){
+    hazardSignatures.set(r,nextSig);
+    changedRoutes.add(r);
+   }
+  }
   hazardCache.clear();
   for(const [k,v] of next)hazardCache.set(k,v);
+  for(const r of changedRoutes)void invalidateAndPushInsights(r);
  }catch(e){
   app.log.warn(e,'Hazard cache refresh failed');
  }
@@ -267,6 +332,7 @@ async function reportHazard(socket:AuthedSocket,body:unknown){
   // Push fresh relevance-filtered advisory snapshots to active participants, not raw reports.
   void Promise.allSettled([...io.sockets.sockets.values()].map(s=>snapshot(s as AuthedSocket)));
  }
+ void invalidateAndPushInsights(current.route);
  return outcome;
 }
 let telemetrySampleCount=0;
@@ -302,6 +368,7 @@ io.on('connection',base=>{
     ack?.({ok:false,error:'GPS jump rejected'});return;
    }
    await putFix(vehicleId,fix);
+   const prevRoute=socket.data.route;
    socket.data.route=fix.route;
    const receivedAt=Date.now();
    telemetrySampleCount+=1;
@@ -312,6 +379,21 @@ io.on('connection',base=>{
    }
    ack?.({ok:true,serverTime:receivedAt});
    await snapshot(socket,fix);
+   if(prevRoute!==fix.route){
+    const insightsPayload=await getOrComputeInsights(fix.route);
+    if(socket.connected)socket.emit('insights:update',insightsPayload);
+   }else{
+    const cachedInsights=insightsCache.get(fix.route);
+    if(cachedInsights){
+     let routeActiveCount=0;
+     for(const s of io.sockets.sockets.values()){
+      if((s as AuthedSocket).data.route===fix.route)routeActiveCount+=1;
+     }
+     if(Math.abs(routeActiveCount-cachedInsights.liveVehicles)>1){
+      void invalidateAndPushInsights(fix.route);
+     }
+    }
+   }
   }catch(e){
    app.log.debug({vehicleId,route:normalizedRoute,accepted:false,reason:'Server processing failed'},'telemetry:update');
    app.log.error(e);ack?.({ok:false,error:'Server processing failed'});

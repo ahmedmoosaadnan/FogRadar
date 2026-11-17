@@ -3,17 +3,15 @@ import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Icon } from '../../src/components/Icons';
 import { Card, PageTitle, Pill } from '../../src/components/UI';
-import { useCloud } from '../../src/cloud/CloudContext';
+import { useCloud, type RoadInsights } from '../../src/cloud/CloudContext';
 import { useJourney } from '../../src/context/JourneyContext';
 import { C } from '../../src/theme/colors';
 
-type RoadInsights = { summary_en: string; summary_ur: string; generatedAt: number };
-
 export default function Advisories() {
-  const { status, hazards, updatedAt, apiUrl } = useCloud();
+  const { status, hazards, insights: socketInsights, updatedAt, apiUrl } = useCloud();
   const { startedAt, gpsState, route } = useJourney();
   const [clock, setClock] = useState(Date.now());
-  const [insights, setInsights] = useState<RoadInsights | null>(null);
+  const [polledInsights, setPolledInsights] = useState<RoadInsights | null>(null);
   const [insightsLoading, setInsightsLoading] = useState(false);
   const journeyActive = Boolean(startedAt) && gpsState === 'tracking';
 
@@ -24,7 +22,7 @@ export default function Advisories() {
 
   useEffect(() => {
     if (!journeyActive || !apiUrl || !/^https?:\/\/[^/]+(?::\d+)?$/i.test(apiUrl)) {
-      setInsights(null);
+      setPolledInsights(null);
       setInsightsLoading(false);
       return;
     }
@@ -48,7 +46,7 @@ export default function Advisories() {
           typeof data.generatedAt === 'number'
         ) {
           // Informational display only: never triggers voice or vibration alerts.
-          setInsights({ summary_en: data.summary_en, summary_ur: data.summary_ur, generatedAt: data.generatedAt });
+          setPolledInsights({ summary_en: data.summary_en, summary_ur: data.summary_ur, generatedAt: data.generatedAt });
         }
       } catch {
         // Silent fallback; never disrupts the Advisories screen.
@@ -58,13 +56,19 @@ export default function Advisories() {
       }
     }
     void fetchInsights();
-    const interval = setInterval(() => void fetchInsights(), 30_000);
+    // 15s fallback poll; primary updates arrive instantaneously via Socket.IO insights:update
+    const interval = setInterval(() => void fetchInsights(), 15_000);
     return () => {
       cancelled = true;
       controller?.abort();
       clearInterval(interval);
     };
   }, [journeyActive, apiUrl, route]);
+
+  const insights =
+    socketInsights && (!polledInsights || socketInsights.generatedAt >= polledInsights.generatedAt)
+      ? socketInsights
+      : polledInsights;
 
   const live = status === 'online' && updatedAt !== null && clock - updatedAt < 15_000;
   const feedPillLabel = live
