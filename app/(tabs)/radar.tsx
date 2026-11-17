@@ -20,6 +20,7 @@ import {
   type HeadingSource,
 } from '../../src/utils/roadGeometry';
 import { computeTiltCompensatedHeading, type Vec3 } from '../../src/utils/compassFallback';
+import { computeDataAgeMs } from '../../src/utils/deadReckoning';
 
 const TAB_BAR_HEIGHT = 66;
 
@@ -48,6 +49,9 @@ export default function Radar() {
     lastUploadAt,
     lastUploadError,
     snapshotReceivedCount,
+    gpsToServerMs,
+    serverToClientMs,
+    clockOffsetMs,
   } = useCloud();
   const [clock, setClock] = useState(Date.now());
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -396,6 +400,7 @@ export default function Radar() {
           ownSpeedKmh={freshFix && location?.speedKmh != null ? location.speedKmh : null}
           yawRateDegPerSec={headingState.yawRateDegPerSec}
           showOncoming={showOncoming}
+          clockOffsetMs={clockOffsetMs}
         />
         <ProximityLegend />
 
@@ -435,13 +440,14 @@ export default function Radar() {
                 green: '#34D399',
                 uncertain: '#94A3B8',
               }[cat];
+              const dataAgeMs = computeDataAgeMs(v.fixTime, clock, clockOffsetMs) ?? v.ageMs;
               return (
                 <View key={v.id} style={s.row}>
                   <View style={[s.dot, { backgroundColor: color }]} />
                   <Text style={s.rowName}>Vehicle {index + 1}</Text>
                   <Text style={s.rowDistance}>{formatVehicleDistance(v.distanceMeters)}</Text>
                   <Text style={s.rowMeta}>
-                    {v.speedKmh ?? '—'} km/h · ±{v.accuracyMeters} m · {(v.ageMs / 1000).toFixed(1)}s
+                    {v.speedKmh ?? '—'} km/h · ±{v.accuracyMeters} m · {(dataAgeMs / 1000).toFixed(1)}s age
                   </Text>
                 </View>
               );
@@ -466,6 +472,9 @@ export default function Radar() {
           <View style={s.advancedBox}>
             <Text style={s.advancedText}>
               Snapshot: {feedAge === null ? 'none' : `${(feedAge / 1000).toFixed(1)}s old`} · Received: {snapshotReceivedCount} · Drawn: {liveVehicles.length}
+            </Text>
+            <Text style={s.advancedText}>
+              GPS→Server: {gpsToServerMs === null ? '—' : `${gpsToServerMs} ms`} · Server→Client: {serverToClientMs === null ? '—' : `${serverToClientMs} ms`} · Offset: {clockOffsetMs} ms
             </Text>
             <Text style={s.advancedText}>
               GPS: {fixAge === null ? 'no fix' : `${(fixAge / 1000).toFixed(1)}s old`} · Accuracy ±{ownAccuracy ?? '—'}m · Radar: {feedAge === null ? 'none' : `${(feedAge / 1000).toFixed(1)}s old`}

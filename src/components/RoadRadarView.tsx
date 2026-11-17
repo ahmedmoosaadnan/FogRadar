@@ -22,6 +22,7 @@ import {
   type HeadingSource,
   type ProjectedVehicle,
 } from '../utils/roadGeometry';
+import { extrapolateVehiclePosition } from '../utils/deadReckoning';
 
 export { proximityColor } from '../utils/proximity';
 
@@ -315,6 +316,7 @@ export function RoadRadarView({
   ownSpeedKmh = null,
   yawRateDegPerSec = 0,
   showOncoming = true,
+  clockOffsetMs = 0,
 }: {
   vehicles?: NearbyVehicle[];
   hazards?: LiveHazard[];
@@ -324,16 +326,25 @@ export function RoadRadarView({
   ownSpeedKmh?: number | null;
   yawRateDegPerSec?: number;
   showOncoming?: boolean;
+  clockOffsetMs?: number;
 }) {
+  const extrapolatedVehicles = useMemo(() => {
+    const now = Date.now();
+    return vehicles.map(v => {
+      const ex = extrapolateVehiclePosition(v, now, clockOffsetMs);
+      return { ...v, distanceMeters: Math.round(ex.distanceMeters), bearing: ex.bearing };
+    });
+  }, [vehicles, clockOffsetMs]);
+
   const projected = useMemo(() => {
     if (effectiveHeading === null) return [];
     const list: ProjectedVehicle[] = [];
-    for (const v of vehicles) {
+    for (const v of extrapolatedVehicles) {
       const p = projectVehicleToRoad(v, effectiveHeading, ownAccuracy);
       if (p && (showOncoming || p.direction !== 'oncoming')) list.push(p);
     }
     return list;
-  }, [vehicles, effectiveHeading, ownAccuracy, showOncoming]);
+  }, [extrapolatedVehicles, effectiveHeading, ownAccuracy, showOncoming]);
 
   const animRef = useRef<AnimState>({ from: {}, to: {}, startedAt: Date.now() });
   const currentRef = useRef<Record<string, { forwardMeters: number; laneOffset: number; distanceMeters: number }>>({});
@@ -365,7 +376,7 @@ export function RoadRadarView({
   useEffect(() => {
     let raf = 0;
     let lastFrame = 0;
-    const DURATION_MS = 1800;
+    const DURATION_MS = 500;
 
     const step = (ts: number) => {
       const frameInterval = lowPerf ? 66 : 33; // 30fps normal, 15fps performance guard
@@ -480,9 +491,9 @@ export function RoadRadarView({
             </SvgText>
           </G>
 
-          {vehicles.map((v, idx) => {
+          {extrapolatedVehicles.map((v, idx) => {
             const baseR = Math.max(46, scaleDistanceNorm(v.distanceMeters) * maxR);
-            const count = Math.max(1, vehicles.length);
+            const count = Math.max(1, extrapolatedVehicles.length);
             const angle = (35 * Math.PI) / 180 + (idx * 2 * Math.PI) / count;
             const r = baseR + (count > 4 ? (idx % 2 === 0 ? 0 : 12) : 0);
             const vx = center + r * Math.sin(angle);

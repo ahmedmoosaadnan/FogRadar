@@ -13,6 +13,7 @@ export type NearbyVehicle = {
   heading: number | null;
   accuracyMeters: number;
   ageMs: number;
+  fixTime?: number;
 };
 export type LiveHazard = {
   id: string;
@@ -23,7 +24,7 @@ export type LiveHazard = {
   status: string;
 };
 type CloudStatus = 'not-configured' | 'idle' | 'connecting' | 'online' | 'offline';
-type TelemetryAck = { ok: boolean; error?: string };
+type TelemetryAck = { ok: boolean; error?: string; serverTime?: number };
 type ProbeResult = { ok: boolean; message: string; latencyMs: number | null };
 type CloudState = {
   status: CloudStatus;
@@ -34,6 +35,9 @@ type CloudState = {
   lastUploadAt: number | null;
   lastUploadError: string | null;
   snapshotReceivedCount: number;
+  gpsToServerMs: number | null;
+  serverToClientMs: number | null;
+  clockOffsetMs: number;
   apiUrl: string;
   setServerUrl: (url: string) => void;
   probeServer: (url?: string) => Promise<ProbeResult>;
@@ -56,6 +60,10 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
   const [lastUploadAt, setLastUploadAt] = useState<number | null>(null);
   const [lastUploadError, setLastUploadError] = useState<string | null>(null);
   const [snapshotReceivedCount, setSnapshotReceivedCount] = useState(0);
+  const [gpsToServerMs, setGpsToServerMs] = useState<number | null>(null);
+  const [serverToClientMs, setServerToClientMs] = useState<number | null>(null);
+  const [clockOffsetMs, setClockOffsetMs] = useState(0);
+  const clockOffsetRef = useRef(0);
   const socketRef = useRef<Socket | null>(null);
   const lastSentRef = useRef(0);
   const alertedRef = useRef(new Set<string>());
@@ -128,13 +136,16 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
     const socket = socketRef.current;
     if (!socket?.connected || !loc) return;
     const now = Date.now();
-    if (now - lastSentRef.current < 600) return;
-    const sendTs = Math.max(now, lastSentRef.current + 600);
+    // Upload every fresh fix (max 1 per second)
+    if (now - lastSentRef.current < 950) return;
+    const sendTs = Math.max(now, lastSentRef.current + 950);
     lastSentRef.current = sendTs;
     const wireAccuracy =
       loc.accuracyMeters !== null && Number.isFinite(loc.accuracyMeters)
         ? Math.min(45, Math.max(1, Math.round(loc.accuracyMeters)))
         : 25;
+    const fixTime = loc.fixTime ?? loc.timestamp;
+    const sentAt = Date.now();
     socket.timeout(5000).emit(
       'telemetry:update',
       {
@@ -144,6 +155,8 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
         heading: loc.heading,
         accuracyMeters: wireAccuracy,
         timestamp: sendTs,
+        fixTime,
+        sentAt,
         route: routeRef.current,
       },
       (timeout: Error | null, result?: TelemetryAck) => {
@@ -155,8 +168,20 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
           setLastUploadError(result?.error ?? 'GPS update rejected');
           return;
         }
-        setLastUploadAt(Date.now());
+        const ackAt = Date.now();
+        setLastUploadAt(ackAt);
         setLastUploadError(null);
+        if (typeof result.serverTime === 'number' && Number.isFinite(result.serverTime)) {
+          const rtt = Math.max(0, ackAt - sentAt);
+          const sampleOffset = result.serverTime - (sentAt + rtt / 2);
+          const nextOffset =
+            clockOffsetRef.current === 0
+              ? sampleOffset
+              : clockOffsetRef.current * 0.75 + sampleOffset * 0.25;
+          clockOffsetRef.current = nextOffset;
+          setClockOffsetMs(Math.round(nextOffset));
+          setGpsToServerMs(Math.max(0, Math.round(result.serverTime - nextOffset - fixTime)));
+        }
       }
     );
   }, []);
@@ -221,7 +246,7 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
 
         sock = io(apiUrl, {
           auth: { token: data.token },
-          transports: ['websocket', 'polling'],
+          transports: ['websocket'],
           reconnection: true,
           reconnectionDelay: 1500,
           reconnectionDelayMax: 8000,
@@ -254,8 +279,9 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
             setError(`Connecting to FogRadar… (${e.message})`);
           }
         });
-        sock.on('radar:snapshot', (payload: { vehicles?: NearbyVehicle[] }) => {
+        sock.on('radar:snapshot', (payload: { vehicles?: NearbyVehicle[]; serverTime?: number }) => {
           if (cancelled) return;
+          const clientNow = Date.now();
           const rawList = Array.isArray(payload?.vehicles) ? payload.vehicles : [];
           const valid: NearbyVehicle[] = [];
           for (const v of rawList) {
@@ -263,9 +289,13 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
             if (!Number.isFinite(v.ageMs) || v.ageMs > 15_000) continue;
             valid.push(v);
           }
+          if (typeof payload?.serverTime === 'number' && Number.isFinite(payload.serverTime)) {
+            const s2c = Math.max(0, Math.round(clientNow + clockOffsetRef.current - payload.serverTime));
+            setServerToClientMs(s2c);
+          }
           setSnapshotReceivedCount(rawList.length);
           setVehicles(valid);
-          setUpdatedAt(Date.now());
+          setUpdatedAt(clientNow);
         });
         sock.on('hazards:snapshot', (payload: { hazards?: LiveHazard[] }) => {
           if (cancelled) return;
@@ -346,6 +376,9 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
       lastUploadAt,
       lastUploadError,
       snapshotReceivedCount,
+      gpsToServerMs,
+      serverToClientMs,
+      clockOffsetMs,
       apiUrl,
       setServerUrl,
       probeServer,
@@ -359,6 +392,9 @@ export function CloudProvider({ children }: { children: React.ReactNode }) {
       lastUploadAt,
       lastUploadError,
       snapshotReceivedCount,
+      gpsToServerMs,
+      serverToClientMs,
+      clockOffsetMs,
       apiUrl,
       setServerUrl,
       probeServer,

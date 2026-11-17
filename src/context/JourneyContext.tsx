@@ -10,6 +10,7 @@ export type Telemetry = {
   heading: number | null;
   accuracyMeters: number | null;
   timestamp: number;
+  fixTime: number;
   receivedAt: number;
 };
 export type TripSummary = {
@@ -188,6 +189,7 @@ export function JourneyProvider({ children }: { children: React.ReactNode }) {
       heading: heading != null && Number.isFinite(heading) && heading >= 0 ? Math.round(heading) : null,
       accuracyMeters: accuracy != null && Number.isFinite(accuracy) && accuracy >= 0 ? Math.round(accuracy) : null,
       timestamp: effectiveTimestamp,
+      fixTime: point.timestamp,
       receivedAt,
     };
     latestFixRef.current = fix;
@@ -286,7 +288,7 @@ export function JourneyProvider({ children }: { children: React.ReactNode }) {
         );
       }
       const subscription = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.High, distanceInterval: 0, timeInterval: 1000 },
+        { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 0, timeInterval: 1000 },
         applyLocation,
         reason => {
           if (activeRef.current && generation === generationRef.current) setError(`GPS: ${reason}`);

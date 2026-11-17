@@ -6,5 +6,10 @@ ios/
 .env
 .env.*
 !.env.example
+*.jks
+*.keystore
+*.p8
+*.p12
+*.mobileprovision
 *.log
 .DS_Store

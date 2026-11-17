@@ -17,7 +17,7 @@ const rawDbUrl=process.env.DATABASE_URL;
 if(!rawDbUrl)throw new Error('DATABASE_URL environment variable is required');
 const port=Number(process.env.PORT||4000);
 const corsOrigin=!process.env.CORS_ORIGIN||process.env.CORS_ORIGIN==='*'?true:process.env.CORS_ORIGIN.split(',').map(s=>s.trim());
-const app=Fastify({logger:{level:process.env.LOG_LEVEL||'debug'},bodyLimit:16*1024});
+const app=Fastify({logger:{level:process.env.LOG_LEVEL||'info'},bodyLimit:16*1024});
 await app.register(cors,{origin:corsOrigin});
 const redis=createClient({
  url:redisUrl,
@@ -33,12 +33,12 @@ const pool=new pg.Pool({
  ...(!isLocalDb||process.env.DATABASE_SSL==='true'?{ssl:{rejectUnauthorized:false}}:{}),
 });
 await pool.query('SELECT postgis_version()'); // Fail fast when DB isn't ready.
-const io=new SocketServer(app.server,{cors:{origin:corsOrigin},transports:['websocket','polling'],maxHttpBufferSize:16*1024});
+const io=new SocketServer(app.server,{cors:{origin:corsOrigin},transports:['websocket'],perMessageDeflate:false,pingInterval:10_000,pingTimeout:5_000,maxHttpBufferSize:16*1024});
 const routes=new Set(['M-1 Motorway','M-2 Motorway','M-3 Motorway','M-4 Motorway','M-5 Motorway','M-9 Motorway']);
 const hazardTypes=new Set(['Stopped traffic','Accident','Heavy fog','Vehicle breakdown']);
 const GEO_KEY='fog:live:geo',ACTIVE_KEY='fog:live:active';
-type Fix={latitude:number;longitude:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;timestamp:number;route:string;seenAt:number};
-type AuthedSocket=Socket & {data:{vehicleId:string;lastReportAt?:number}};
+type Fix={latitude:number;longitude:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;timestamp:number;fixTime:number;route:string;seenAt:number};
+type AuthedSocket=Socket & {data:{vehicleId:string;lastReportAt?:number;lastSnapshotAt?:number;route?:string}};
 const sessionLimit=new Map<string,{count:number;until:number}>();
 const insightsCache=new Map<string,InsightsResponse>();
 app.get('/health',async()=>({ok:true,service:'FogRadar MVP',phase:'FIELD-TEST-ONLY',time:Date.now()}));
@@ -111,7 +111,8 @@ function parseFix(raw:unknown):Fix|null{
  if(!validNum(x.latitude,-90,90)||!validNum(x.longitude,-180,180)||!validNum(x.accuracyMeters,0,50000)||!validNum(x.timestamp,now-300_000,now+300_000)||!route)return null;
  if(x.speedKmh!==null&&!validNum(x.speedKmh,0,220))return null;
  if(x.heading!==null&&!validNum(x.heading,0,360))return null;
- return {latitude:x.latitude,longitude:x.longitude,accuracyMeters:x.accuracyMeters,timestamp:x.timestamp,route,speedKmh:x.speedKmh as number|null,heading:x.heading as number|null,seenAt:now};
+ const fixTime=validNum(x.fixTime,now-300_000,now+300_000)?x.fixTime:x.timestamp;
+ return {latitude:x.latitude,longitude:x.longitude,accuracyMeters:x.accuracyMeters,timestamp:x.timestamp,fixTime,route,speedKmh:x.speedKmh as number|null,heading:x.heading as number|null,seenAt:now};
 }
 async function getFix(id:string):Promise<Fix|null>{
  const data=await redis.get(`fog:live:vehicle:${id}`);
@@ -128,60 +129,103 @@ async function putFix(id:string,fix:Fix){
 async function removeFix(id:string){
  await redis.multi().zRem(GEO_KEY,id).zRem(ACTIVE_KEY,id).del(`fog:live:vehicle:${id}`).exec();
 }
-async function nearby(id:string,own:Fix){
- const ids=(await redis.sendCommand(['GEOSEARCH',GEO_KEY,'FROMLONLAT',String(own.longitude),String(own.latitude),'BYRADIUS','1000','m','COUNT','150'])) as string[];
- const others=ids.filter(v=>v!==id);
- const selfExcluded=ids.length-others.length;
- let missingRecord=0,filteredStale=0,filteredRoute=0,filteredDistance=0;
- const visible: Array<{id:string;distanceMeters:number;bearing:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;ageMs:number}>=[];
- if(others.length){
-  const records=await redis.mGet(others.map(v=>`fog:live:vehicle:${v}`));
-  records.forEach((raw,index)=>{
-   if(!raw){missingRecord+=1;return;}
-   try{
-    const v=JSON.parse(raw) as Fix,age=Date.now()-v.seenAt;
-    if(age>12_000){filteredStale+=1;return;}
-    if(v.route!==own.route){filteredRoute+=1;return;}
-    const distance=metersBetween(own,v);
-    if(distance>1000){filteredDistance+=1;return;}
-    visible.push({id:others[index],distanceMeters:Math.round(distance),bearing:Math.round(bearingDegrees(own,v)),speedKmh:v.speedKmh,heading:v.heading,accuracyMeters:v.accuracyMeters,ageMs:age});
-   }catch{ /* ignore corrupted ephemeral entries */ }
+type SnapshotVehicle={id:string;distanceMeters:number;bearing:number;speedKmh:number|null;heading:number|null;accuracyMeters:number;ageMs:number;fixTime:number};
+function filterNearbyFromPool(id:string,own:Fix,candidates:Array<{id:string;fix:Fix}>):SnapshotVehicle[]{
+ const now=Date.now();
+ const visible:SnapshotVehicle[]=[];
+ for(const item of candidates){
+  if(item.id===id)continue;
+  const age=now-item.fix.seenAt;
+  if(age>12_000 || item.fix.route!==own.route)continue;
+  const distance=metersBetween(own,item.fix);
+  if(distance>1000)continue;
+  visible.push({
+   id:item.id,
+   distanceMeters:Math.round(distance),
+   bearing:Math.round(bearingDegrees(own,item.fix)),
+   speedKmh:item.fix.speedKmh,
+   heading:item.fix.heading,
+   accuracyMeters:item.fix.accuracyMeters,
+   ageMs:age,
+   fixTime:item.fix.fixTime,
   });
  }
- app.log.debug({vehicleId:id,route:own.route,geoSearchTotal:ids.length,selfExcluded,missingRecord,filteredStale,filteredRoute,filteredDistance,returned:visible.length},'nearby GEOSEARCH summary');
  return visible.sort((a,b)=>a.distanceMeters-b.distanceMeters).slice(0,80);
 }
+async function fetchGeoCandidates(lon:number,lat:number,radiusMeters=1000):Promise<Array<{id:string;fix:Fix}>>{
+ const ids=(await redis.sendCommand(['GEOSEARCH',GEO_KEY,'FROMLONLAT',String(lon),String(lat),'BYRADIUS',String(radiusMeters),'m','COUNT','200'])) as string[];
+ if(!ids.length)return [];
+ const records=await redis.mGet(ids.map(v=>`fog:live:vehicle:${v}`));
+ const out:Array<{id:string;fix:Fix}>=[];
+ records.forEach((raw,index)=>{
+  if(!raw)return;
+  try{
+   const fix=JSON.parse(raw) as Fix;
+   out.push({id:ids[index],fix});
+  }catch{ /* ignore corrupted ephemeral entries */ }
+ });
+ return out;
+}
+async function nearby(id:string,own:Fix){
+ const candidates=await fetchGeoCandidates(own.longitude,own.latitude,1000);
+ return filterNearbyFromPool(id,own,candidates);
+}
 type HazardRow={id:string;type:string;route:string;latitude:number;longitude:number;heading:number;report_count:number;expires_at:Date};
-async function hazardsAhead(own:Fix){
- const rows=await pool.query<HazardRow>(`SELECT id,type,route,latitude,longitude,heading,report_count,expires_at
- FROM hazards WHERE route=$1 AND status='corroborated' AND expires_at>NOW()
- AND ST_DWithin(position,ST_SetSRID(ST_MakePoint($2,$3),4326)::geography,1000)
- ORDER BY created_at DESC LIMIT 30`,[own.route,own.longitude,own.latitude]);
- return rows.rows.filter(v=>own.heading===null?true:isAhead({...own,heading:own.heading},v)).map(v=>({
+type CachedHazard={id:string;type:string;route:string;latitude:number;longitude:number;heading:number;report_count:number;expiresAtMs:number};
+const hazardCache=new Map<string,CachedHazard[]>();
+async function refreshHazardCache(){
+ try{
+  const rows=await pool.query<HazardRow>(
+   `SELECT id,type,route,latitude,longitude,heading,report_count,expires_at
+    FROM hazards WHERE status='corroborated' AND expires_at>NOW()
+    ORDER BY created_at DESC LIMIT 200`
+  );
+  const next=new Map<string,CachedHazard[]>();
+  for(const r of rows.rows){
+   const list=next.get(r.route)??[];
+   list.push({
+    id:r.id,type:r.type,route:r.route,latitude:Number(r.latitude),longitude:Number(r.longitude),
+    heading:Number(r.heading),report_count:Number(r.report_count),expiresAtMs:new Date(r.expires_at).getTime(),
+   });
+   next.set(r.route,list);
+  }
+  hazardCache.clear();
+  for(const [k,v] of next)hazardCache.set(k,v);
+ }catch(e){
+  app.log.warn(e,'Hazard cache refresh failed');
+ }
+}
+await refreshHazardCache();
+function hazardsAhead(own:Fix){
+ const now=Date.now();
+ const cached=(hazardCache.get(own.route)??[]).filter(h=>h.expiresAtMs>now && metersBetween(own,h)<=1000);
+ return cached.filter(v=>own.heading===null?true:isAhead({...own,heading:own.heading},v)).map(v=>({
    id:v.id,type:v.type,distanceMeters:Math.round(metersBetween(own,v)),reportCount:v.report_count,
-   expiresAt:new Date(v.expires_at).getTime(),status:'corroborated-experimental' as const,
+   expiresAt:v.expiresAtMs,status:'corroborated-experimental' as const,
  })).sort((a,b)=>a.distanceMeters-b.distanceMeters);
 }
-async function snapshot(socket:AuthedSocket){
- const own=await getFix(socket.data.vehicleId);
+async function snapshot(socket:AuthedSocket,preloadedOwn?:Fix,preloadedPool?:Array<{id:string;fix:Fix}>){
+ const now=Date.now();
+ if(now-(socket.data.lastSnapshotAt??0)<500)return;
+ const own=preloadedOwn??await getFix(socket.data.vehicleId);
  if(!own){
-  app.log.debug({vehicleId:socket.data.vehicleId},'snapshot: no fresh own fix in Redis, emitting empty radar:snapshot');
-  socket.emit('radar:snapshot',{vehicles:[],serverTime:Date.now()});
-  socket.emit('hazards:snapshot',{hazards:[],serverTime:Date.now()});
+  socket.data.lastSnapshotAt=now;
+  if(socket.connected){
+   socket.volatile.emit('radar:snapshot',{vehicles:[],serverTime:now});
+   socket.emit('hazards:snapshot',{hazards:[],serverTime:now});
+  }
   return;
  }
- const [nearbyRes,hazardsRes]=await Promise.allSettled([nearby(socket.data.vehicleId,own),hazardsAhead(own)]);
- const vehicles=nearbyRes.status==='fulfilled'?nearbyRes.value:[];
- const hazards=hazardsRes.status==='fulfilled'?hazardsRes.value:[];
- if(nearbyRes.status==='rejected')app.log.error(nearbyRes.reason,'nearby() failed during snapshot');
- if(hazardsRes.status==='rejected')app.log.error(hazardsRes.reason,'hazardsAhead() failed during snapshot');
+ const vehicles=preloadedPool?filterNearbyFromPool(socket.data.vehicleId,own,preloadedPool):await nearby(socket.data.vehicleId,own);
+ const hazards=hazardsAhead(own);
  if(socket.connected){
-  socket.emit('radar:snapshot',{vehicles,serverTime:Date.now()});
-  socket.emit('hazards:snapshot',{hazards,serverTime:Date.now()});
-  app.log.debug({vehicleId:socket.data.vehicleId,route:own.route,vehiclesEmitted:vehicles.length,hazardsEmitted:hazards.length},'snapshot emitted');
+  const emitTime=Date.now();
+  socket.data.lastSnapshotAt=emitTime;
+  socket.volatile.emit('radar:snapshot',{vehicles,serverTime:emitTime});
+  socket.emit('hazards:snapshot',{hazards,serverTime:emitTime});
  }
 }
-type Ack=(response:{ok:boolean;error?:string;id?:string;status?:string;reportCount?:number})=>void;
+type Ack=(response:{ok:boolean;error?:string;serverTime?:number;id?:string;status?:string;reportCount?:number})=>void;
 async function reportHazard(socket:AuthedSocket,body:unknown){
  if(!body||typeof body!=='object'||!hazardTypes.has((body as {type?:string}).type??''))throw Error('Invalid hazard type');
  const type=(body as {type:string}).type;
@@ -219,11 +263,13 @@ async function reportHazard(socket:AuthedSocket,body:unknown){
  }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
  socket.data.lastReportAt=Date.now();
  if(outcome.status==='corroborated'){
+  await refreshHazardCache();
   // Push fresh relevance-filtered advisory snapshots to active participants, not raw reports.
   void Promise.allSettled([...io.sockets.sockets.values()].map(s=>snapshot(s as AuthedSocket)));
  }
  return outcome;
 }
+let telemetrySampleCount=0;
 io.use((socket,next)=>{
  const claims=verifyToken(secret,socket.handshake.auth?.token);
  if(!claims)return next(new Error('Invalid or expired journey session'));
@@ -256,8 +302,16 @@ io.on('connection',base=>{
     ack?.({ok:false,error:'GPS jump rejected'});return;
    }
    await putFix(vehicleId,fix);
-   app.log.debug({vehicleId,route:fix.route,accepted:true,reason:'ok'},'telemetry:update');
-   ack?.({ok:true});await snapshot(socket);
+   socket.data.route=fix.route;
+   const receivedAt=Date.now();
+   telemetrySampleCount+=1;
+   if(telemetrySampleCount%20===1){
+    const sentAtRaw=raw&&typeof raw==='object'?(raw as {sentAt?:unknown}).sentAt:undefined;
+    const sentAt=typeof sentAtRaw==='number'&&Number.isFinite(sentAtRaw)?sentAtRaw:fix.timestamp;
+    app.log.info({vehicleId,route:fix.route,uploadLatencyMs:receivedAt-sentAt,fixToReceiveMs:receivedAt-fix.fixTime},'telemetry:update latency sample');
+   }
+   ack?.({ok:true,serverTime:receivedAt});
+   await snapshot(socket,fix);
   }catch(e){
    app.log.debug({vehicleId,route:normalizedRoute,accepted:false,reason:'Server processing failed'},'telemetry:update');
    app.log.error(e);ack?.({ok:false,error:'Server processing failed'});
@@ -272,10 +326,33 @@ io.on('connection',base=>{
 // Redis GEO is an index, not a TTL structure. Purge stale members periodically.
 // Small field-test cohort only: refresh every connected phone's snapshot every 2 seconds.
 // A production rollout must replace this O(N²) polling with geo-sharded fan-out.
-const refresh=setInterval(()=>{
- const sockets=[...io.sockets.sockets.values()].slice(0,30);
- void Promise.allSettled(sockets.map(s=>snapshot(s as AuthedSocket))).catch(e=>app.log.error(e));
-},2000);
+const hazardRefreshTimer=setInterval(()=>void refreshHazardCache(),3000);
+// 1-second radar loop: one GEOSEARCH per route group per tick, reusing fetched results
+const refresh=setInterval(async()=>{
+ try{
+  const sockets=[...io.sockets.sockets.values()] as AuthedSocket[];
+  if(!sockets.length)return;
+  const ownFixes=await Promise.all(sockets.map(s=>getFix(s.data.vehicleId)));
+  const byRoute=new Map<string,Array<{socket:AuthedSocket;own:Fix}>>();
+  for(let i=0;i<sockets.length;i++){
+   const own=ownFixes[i];
+   if(!own){
+    await snapshot(sockets[i]);
+    continue;
+   }
+   const list=byRoute.get(own.route)??[];
+   list.push({socket:sockets[i],own});
+   byRoute.set(own.route,list);
+  }
+  await Promise.allSettled(
+   [...byRoute.entries()].map(async([,group])=>{
+    const anchor=group[0].own;
+    const pool=await fetchGeoCandidates(anchor.longitude,anchor.latitude,2500);
+    await Promise.allSettled(group.map(({socket,own})=>snapshot(socket,own,pool)));
+   })
+  );
+ }catch(e){app.log.error(e);}
+},1000);
 const sweep=setInterval(async()=>{
  try{const ids=await redis.zRangeByScore(ACTIVE_KEY,0,Date.now()-20_000,{LIMIT:{offset:0,count:500}});
   if(ids.length){const tx=redis.multi();for(const id of ids){tx.zRem(ACTIVE_KEY,id);tx.zRem(GEO_KEY,id);tx.del(`fog:live:vehicle:${id}`);}await tx.exec();}
@@ -283,5 +360,5 @@ const sweep=setInterval(async()=>{
  }catch(e){app.log.error(e,'Stale position sweep failed');}
 },10_000);
 await app.listen({port,host:process.env.HOST||'0.0.0.0'});
-const shutdown=async()=>{clearInterval(refresh);clearInterval(sweep);await new Promise<void>(resolve=>io.close(()=>resolve()));await app.close();await redis.quit();await pool.end();process.exit(0);};
+const shutdown=async()=>{clearInterval(hazardRefreshTimer);clearInterval(refresh);clearInterval(sweep);await new Promise<void>(resolve=>io.close(()=>resolve()));await app.close();await redis.quit();await pool.end();process.exit(0);};
 process.on('SIGINT',()=>void shutdown());process.on('SIGTERM',()=>void shutdown());
