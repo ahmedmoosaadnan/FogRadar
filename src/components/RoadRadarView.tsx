@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Dimensions, StyleSheet, Text, View } from 'react-native';
+import { Dimensions, Platform, StyleSheet, Text, View } from 'react-native';
 import Svg, {
   Circle,
   Defs,
@@ -8,6 +8,7 @@ import Svg, {
   LinearGradient,
   Path,
   Polygon,
+  RadialGradient,
   Rect,
   Stop,
   Text as SvgText,
@@ -18,14 +19,22 @@ import {
   LANE_WIDTH_METERS,
   projectVehicleToRoad,
   scaleDistanceNorm,
+  type HeadingSource,
   type ProjectedVehicle,
 } from '../utils/roadGeometry';
 
 export { proximityColor } from '../utils/proximity';
 
+const SVG_FONT = Platform.select({
+  web: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+  ios: 'System',
+  android: 'sans-serif',
+  default: 'sans-serif',
+});
+
 const WIDTH = Math.min(Dimensions.get('window').width - 28, 400);
 const HEIGHT = 420;
-const TOP_Y = 26;
+const TOP_Y = 28;
 const OWN_Y = HEIGHT - 82;
 const ROAD_LEN = OWN_Y - TOP_Y;
 const OWN_X = WIDTH * 0.44;
@@ -104,7 +113,7 @@ export function ProximityLegend() {
         ● Red ≤80 m · ● Yellow 80–250 m · ● Green 250–1000 m · ● Gray Uncertain
       </Text>
       <Text style={s.legendDetail}>
-        Centered halo = lateral GPS uncertainty exceeds lane offset. Color ≠ collision-risk score.
+        Centered halo = GPS uncertainty exceeds lane offset. Color ≠ collision-risk score.
       </Text>
     </View>
   );
@@ -136,15 +145,14 @@ function VehicleCarSvg({
           cy={0}
           r={carH * 0.72}
           fill={style.stroke}
-          fillOpacity={0.1}
+          fillOpacity={0.12}
           stroke={style.stroke}
-          strokeOpacity={0.5}
+          strokeOpacity={0.55}
           strokeWidth={1.2}
           strokeDasharray="3 3"
         />
       ) : null}
       <G rotation={oncoming ? 180 : 0}>
-        {/* Headlight / direction glow */}
         <Polygon
           points={`${-carW * 0.35},${-carH * 0.48} ${carW * 0.35},${-carH * 0.48} ${carW * 0.6},${-carH * 0.88} ${-carW * 0.6},${-carH * 0.88}`}
           fill={oncoming ? '#FBBF24' : style.stroke}
@@ -160,7 +168,6 @@ function VehicleCarSvg({
           stroke={oncoming ? '#FBBF24' : style.stroke}
           strokeWidth={1.8}
         />
-        {/* Windshield */}
         <Rect
           x={-carW * 0.34}
           y={-carH * 0.22}
@@ -171,34 +178,35 @@ function VehicleCarSvg({
           fillOpacity={0.35}
         />
       </G>
-      {/* Real distance + speed label */}
       <Rect
-        x={-30}
+        x={-32}
         y={carH * 0.52 + 2}
-        width={60}
-        height={24}
+        width={64}
+        height={25}
         rx={6}
         fill="#070D14"
-        fillOpacity={0.9}
+        fillOpacity={0.92}
         stroke={style.stroke}
         strokeWidth={0.9}
       />
       <SvgText
         x={0}
-        y={carH * 0.52 + 12.5}
+        y={carH * 0.52 + 13}
         fill="#FFFFFF"
-        fontSize={10}
+        fontSize={10.5}
         fontWeight="900"
+        fontFamily={SVG_FONT}
         textAnchor="middle"
       >
         {Math.round(proj.distanceMeters)} m
       </SvgText>
       <SvgText
         x={0}
-        y={carH * 0.52 + 22.5}
+        y={carH * 0.52 + 23.5}
         fill={style.text}
         fontSize={8.5}
         fontWeight="700"
+        fontFamily={SVG_FONT}
         textAnchor="middle"
       >
         {proj.speedKmh !== null ? `${proj.speedKmh} km/h` : '— km/h'}
@@ -211,12 +219,14 @@ export function RoadRadarView({
   vehicles = [],
   hazards = [],
   effectiveHeading = null,
+  headingSource = 'unknown',
   ownAccuracy = null,
   yawRateDegPerSec = 0,
 }: {
   vehicles?: NearbyVehicle[];
   hazards?: LiveHazard[];
   effectiveHeading?: number | null;
+  headingSource?: HeadingSource;
   ownAccuracy?: number | null;
   yawRateDegPerSec?: number;
 }) {
@@ -230,7 +240,6 @@ export function RoadRadarView({
     return list;
   }, [vehicles, effectiveHeading, ownAccuracy]);
 
-  // Smooth ~1.8s interpolation between snapshots
   const animRef = useRef<AnimState>({ from: {}, to: {}, startedAt: Date.now() });
   const currentRef = useRef<Record<string, { forwardMeters: number; laneOffset: number; distanceMeters: number }>>({});
   const [renderTick, setRenderTick] = useState(0);
@@ -257,7 +266,6 @@ export function RoadRadarView({
     const DURATION_MS = 1800;
 
     const step = (ts: number) => {
-      // ~30fps cap to stay lightweight on low-end Android
       if (ts - lastFrame >= 33) {
         lastFrame = ts;
         const elapsed = Date.now() - animRef.current.startedAt;
@@ -284,19 +292,34 @@ export function RoadRadarView({
     return () => cancelAnimationFrame(raf);
   }, [targetCurvePx]);
 
-  // Unknown heading: do NOT guess direction — render distance-only ring view
+  // Unknown heading: Distance-only ring view (never guesses left/right)
   if (effectiveHeading === null) {
     const center = WIDTH / 2;
-    const cy = HEIGHT / 2 + 10;
-    const maxR = Math.min(WIDTH, HEIGHT) * 0.41;
+    const cy = HEIGHT / 2 + 12;
+    const maxR = Math.min(WIDTH, HEIGHT) * 0.4;
 
     return (
       <View style={[s.container, { width: WIDTH, height: HEIGHT }]}>
         <Svg width={WIDTH} height={HEIGHT} viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
+          <Defs>
+            <RadialGradient id="youGlow" cx="50%" cy="50%" r="50%">
+              <Stop offset="0%" stopColor="#10B981" stopOpacity="0.45" />
+              <Stop offset="100%" stopColor="#10B981" stopOpacity="0" />
+            </RadialGradient>
+          </Defs>
           <Rect x={0} y={0} width={WIDTH} height={HEIGHT} rx={22} fill="#081018" stroke="#1E3A2F" strokeWidth={1.5} />
-          <SvgText x={center} y={24} fill="#FBBF24" fontSize={11} fontWeight="800" textAnchor="middle">
-            HEADING UNKNOWN · DISTANCE-ONLY MODE
+          <SvgText
+            x={center}
+            y={24}
+            fill="#FBBF24"
+            fontSize={10.5}
+            fontWeight="800"
+            fontFamily={SVG_FONT}
+            textAnchor="middle"
+          >
+            DISTANCE-ONLY · DIRECTION UNAVAILABLE
           </SvgText>
+
           {DISTANCE_RINGS.map(ring => {
             const r = scaleDistanceNorm(ring.meters) * maxR;
             return (
@@ -307,48 +330,44 @@ export function RoadRadarView({
                   r={r}
                   fill="none"
                   stroke="#1E3A2F"
-                  strokeWidth={1.2}
+                  strokeWidth={1.3}
                   strokeDasharray="4 4"
                 />
-                <SvgText x={center} y={cy - r + 11} fill="#6EE7B7" fontSize={9.5} fontWeight="700" textAnchor="middle">
+                <SvgText
+                  x={center}
+                  y={cy - r + 13}
+                  fill="#94A3B8"
+                  fontSize={11}
+                  fontWeight="800"
+                  fontFamily={SVG_FONT}
+                  textAnchor="middle"
+                >
                   {ring.label}
                 </SvgText>
               </G>
             );
           })}
-          {/* Own car at center */}
-          <Rect x={center - 13} y={cy - 19} width={26} height={38} rx={7} fill="#FFFFFF" stroke="#10B981" strokeWidth={2} />
-          <SvgText x={center} y={cy + 4} fill="#06472D" fontSize={9} fontWeight="900" textAnchor="middle">
+
+          {/* Subtle glow + Own car at center */}
+          <Circle cx={center} cy={cy} r={34} fill="url(#youGlow)" />
+          <Rect x={center - 13} y={cy - 19} width={26} height={38} rx={7} fill="#FFFFFF" stroke="#10B981" strokeWidth={2.2} />
+          <SvgText x={center} y={cy + 4} fill="#06472D" fontSize={9.5} fontWeight="900" fontFamily={SVG_FONT} textAnchor="middle">
             YOU
           </SvgText>
 
-          {/* Distance-only vehicles placed evenly around their exact distance ring (no directional claim) */}
+          {/* Plot each vehicle as a dot on its real-distance ring, spread evenly */}
           {vehicles.map((v, idx) => {
             const r = Math.max(36, scaleDistanceNorm(v.distanceMeters) * maxR);
-            const angle = ((idx * 137.5) % 360) * (Math.PI / 180);
+            const angle = (idx * 2 * Math.PI) / Math.max(1, vehicles.length);
             const vx = center + r * Math.sin(angle);
             const vy = cy - r * Math.cos(angle);
-            const color = ZONE_STYLE[
-              ownAccuracy !== null && ownAccuracy <= 35 && v.accuracyMeters <= 35
-                ? v.distanceMeters + ownAccuracy + v.accuracyMeters <= 80
-                  ? 'red'
-                  : v.distanceMeters - (ownAccuracy + v.accuracyMeters) > 80 &&
-                      v.distanceMeters + (ownAccuracy + v.accuracyMeters) <= 250
-                    ? 'yellow'
-                    : v.distanceMeters - (ownAccuracy + v.accuracyMeters) > 250 && v.distanceMeters <= 1000
-                      ? 'green'
-                      : 'uncertain'
-                : 'uncertain'
-            ];
+            const style = ZONE_STYLE[proximityColor(v.distanceMeters, ownAccuracy, v.accuracyMeters)];
             return (
               <G key={v.id} transform={`translate(${vx.toFixed(1)}, ${vy.toFixed(1)})`}>
-                <Circle cx={0} cy={0} r={10} fill={color.fill} stroke={color.stroke} strokeWidth={2} />
-                <Rect x={-26} y={13} width={52} height={22} rx={6} fill="#070D14" stroke={color.stroke} strokeWidth={1} />
-                <SvgText x={0} y={23} fill="#FFFFFF" fontSize={9.5} fontWeight="900" textAnchor="middle">
+                <Circle cx={0} cy={0} r={8.5} fill={style.dot} stroke="#070D14" strokeWidth={2} />
+                <Rect x={-26} y={11} width={52} height={18} rx={6} fill="#070D14" stroke={style.stroke} strokeWidth={1} />
+                <SvgText x={0} y={23} fill="#FFFFFF" fontSize={10} fontWeight="900" fontFamily={SVG_FONT} textAnchor="middle">
                   {v.distanceMeters} m
-                </SvgText>
-                <SvgText x={0} y={32} fill={color.text} fontSize={8} fontWeight="700" textAnchor="middle">
-                  {v.speedKmh !== null ? `${v.speedKmh} km/h` : '—'}
                 </SvgText>
               </G>
             );
@@ -358,7 +377,7 @@ export function RoadRadarView({
     );
   }
 
-  // Known heading: Tesla-style curved perspective road view
+  // Known heading (GPS or Compass): Tesla-style curved perspective road view
   void renderTick;
   const animatedVehicles = projected.map(p => {
     const cur = currentRef.current[p.id] ?? p;
@@ -386,6 +405,10 @@ export function RoadRadarView({
             <Stop offset="0%" stopColor="#050A10" />
             <Stop offset="100%" stopColor="#0B1520" />
           </LinearGradient>
+          <RadialGradient id="ownCarGlow" cx="50%" cy="50%" r="50%">
+            <Stop offset="0%" stopColor="#10B981" stopOpacity="0.45" />
+            <Stop offset="100%" stopColor="#10B981" stopOpacity="0" />
+          </RadialGradient>
         </Defs>
 
         <Rect x={0} y={0} width={WIDTH} height={HEIGHT} rx={22} fill="url(#bgGrad)" stroke="#1E3A2F" strokeWidth={1.5} />
@@ -407,7 +430,7 @@ export function RoadRadarView({
         <Path d={medianLine} stroke="#F59E0B" strokeOpacity={0.85} strokeWidth={2.2} fill="none" />
         <Path d={rightEdge} stroke="#334155" strokeWidth={1.6} fill="none" />
 
-        {/* Distance rings (100 m, 250 m, 500 m, 1 km) */}
+        {/* Larger, high-contrast distance rings (100 m, 250 m, 500 m, 1 km) */}
         {DISTANCE_RINGS.map(ring => {
           const t = scaleDistanceNorm(ring.meters);
           const left = roadPoint(t, -1.5, smoothCurvePx);
@@ -420,16 +443,17 @@ export function RoadRadarView({
                 x2={right.x + 10}
                 y2={right.y}
                 stroke="#34D399"
-                strokeOpacity={0.28}
-                strokeWidth={1}
+                strokeOpacity={0.32}
+                strokeWidth={1.1}
                 strokeDasharray="4 4"
               />
               <SvgText
-                x={Math.max(24, left.x - 16)}
-                y={left.y + 3}
-                fill="#94A3B8"
-                fontSize={9.5}
+                x={Math.max(30, left.x - 14)}
+                y={left.y + 4}
+                fill="#CBD5E1"
+                fontSize={11}
                 fontWeight="800"
+                fontFamily={SVG_FONT}
                 textAnchor="end"
               >
                 {ring.label}
@@ -453,14 +477,14 @@ export function RoadRadarView({
           return (
             <G key={h.id} transform={`translate(${pt.x.toFixed(1)}, ${pt.y.toFixed(1)})`}>
               <Polygon points="0,-13 13,10 -13,10" fill="#DC2626" stroke="#FCA5A5" strokeWidth={1.6} />
-              <SvgText x={0} y={6} fill="#FFFFFF" fontSize={10} fontWeight="900" textAnchor="middle">
+              <SvgText x={0} y={6} fill="#FFFFFF" fontSize={10} fontWeight="900" fontFamily={SVG_FONT} textAnchor="middle">
                 !
               </SvgText>
               <Rect x={-36} y={13} width={72} height={22} rx={6} fill="#450A0A" stroke="#EF4444" strokeWidth={1} />
-              <SvgText x={0} y={23} fill="#FEE2E2" fontSize={8.5} fontWeight="900" textAnchor="middle">
+              <SvgText x={0} y={23} fill="#FEE2E2" fontSize={8.5} fontWeight="900" fontFamily={SVG_FONT} textAnchor="middle">
                 {shortType}
               </SvgText>
-              <SvgText x={0} y={32} fill="#FCA5A5" fontSize={8.5} fontWeight="800" textAnchor="middle">
+              <SvgText x={0} y={32} fill="#FCA5A5" fontSize={8.5} fontWeight="800" fontFamily={SVG_FONT} textAnchor="middle">
                 {h.distanceMeters} m
               </SvgText>
             </G>
@@ -475,30 +499,35 @@ export function RoadRadarView({
             const pt = roadPoint(t, v.laneOffset, smoothCurvePx);
             return <VehicleCarSvg key={v.id} x={pt.x} y={pt.y} scale={pt.scale} proj={v} color={color} />;
           }
-          // Vehicle behind: draw in short rear strip
           const rearRatio = Math.min(1, Math.abs(v.forwardMeters) / 150);
           const ry = OWN_Y + 34 + rearRatio * (HEIGHT - OWN_Y - 62);
           const rx = OWN_X + Math.max(-1.2, Math.min(1.2, v.laneOffset)) * LANE_W0;
           return <VehicleCarSvg key={v.id} x={rx} y={ry} scale={0.95} proj={v} color={color} />;
         })}
 
-        {/* Own car at bottom center */}
+        {/* Own car at bottom center with subtle glow */}
         <G transform={`translate(${OWN_X}, ${OWN_Y})`}>
-          <Polygon
-            points="-14,-22 14,-22 22,-54 -22,-54"
-            fill="#10B981"
-            fillOpacity={0.14}
-          />
+          <Circle cx={0} cy={0} r={38} fill="url(#ownCarGlow)" />
+          <Polygon points="-14,-22 14,-22 22,-54 -22,-54" fill="#10B981" fillOpacity={0.16} />
           <Rect x={-14} y={-22} width={28} height={44} rx={8} fill="#FFFFFF" stroke="#10B981" strokeWidth={2.5} />
           <Rect x={-9} y={-11} width={18} height={11} rx={3} fill="#06472D" />
-          <SvgText x={0} y={13} fill="#06472D" fontSize={9} fontWeight="900" textAnchor="middle">
+          <SvgText x={0} y={13} fill="#06472D" fontSize={9.5} fontWeight="900" fontFamily={SVG_FONT} textAnchor="middle">
             YOU
           </SvgText>
         </G>
 
         {/* Top header tag */}
-        <SvgText x={OWN_X} y={16} fill="#6EE7B7" fontSize={9.5} fontWeight="800" textAnchor="middle" letterSpacing={1}>
-          HEADING {Math.round(effectiveHeading)}° ↑ · {LANE_WIDTH_METERS}m LANES
+        <SvgText
+          x={OWN_X}
+          y={17}
+          fill={headingSource === 'compass' ? '#FBBF24' : '#6EE7B7'}
+          fontSize={10}
+          fontWeight="800"
+          fontFamily={SVG_FONT}
+          textAnchor="middle"
+          letterSpacing={0.8}
+        >
+          HEADING {Math.round(effectiveHeading)}° ↑ ({headingSource === 'compass' ? 'COMPASS' : 'GPS'}) · {LANE_WIDTH_METERS}m LANES
         </SvgText>
       </Svg>
     </View>

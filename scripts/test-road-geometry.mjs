@@ -59,9 +59,29 @@ res = updateHeadingTracker(tracker, { speedMps: 1.5, headingDeg: 180, accuracyMe
 tracker = res.state;
 assert.ok(res.effectiveHeading !== null);
 
-// Low speed beyond 10s marks heading unknown (null)
+// Low speed beyond 10s without compass marks heading unknown (null)
 res = updateHeadingTracker(tracker, { speedMps: 1.5, headingDeg: 180, accuracyMeters: 10, now: 12500 });
 assert.equal(res.effectiveHeading, null);
+assert.equal(res.source, 'unknown');
+
+// Low speed beyond 10s WITH compass falls back to source='compass'
+res = updateHeadingTracker(tracker, { speedMps: 1.5, headingDeg: 180, accuracyMeters: 10, compassHeadingDeg: 120, now: 12500 });
+assert.equal(res.source, 'compass');
+assert.ok(res.effectiveHeading !== null);
+
+// GPS course (>= 3 m/s, acc <= 35m) overrides compass and restores source='gps'
+res = updateHeadingTracker(res.state, { speedMps: 8, headingDeg: 45, accuracyMeters: 8, compassHeadingDeg: 120, now: 13000 });
+assert.equal(res.source, 'gps');
+
+// Forward offset within combined GPS uncertainty -> centered with uncertainty halo
+const closeForward = projectVehicleToRoad(
+  { id: 'v_close', distanceMeters: 8, bearing: 45, speedKmh: 20, heading: 0, accuracyMeters: 10, ageMs: 300 },
+  0,
+  10
+);
+assert.ok(closeForward !== null);
+assert.equal(closeForward.laneOffset, 0);
+assert.equal(closeForward.hasUncertaintyHalo, true);
 
 // 5. GPS uncertainty halo & lane threshold:
 // ownAcc=10, otherAcc=10 -> combined=14.14m. Lateral=10m <= 14.14m -> centered in own lane with uncertainty halo

@@ -12,9 +12,13 @@ export type HeadingSample = {
   timestamp: number;
 };
 
+export type HeadingSource = 'gps' | 'compass' | 'unknown';
+
 export type HeadingTrackerState = {
   smoothedHeading: number | null;
   lastGoodAt: number | null;
+  source: HeadingSource;
+  compassSmoothed: number | null;
   history: HeadingSample[];
 };
 
@@ -43,7 +47,7 @@ export type ProjectedVehicle = {
 };
 
 export function createHeadingTrackerState(): HeadingTrackerState {
-  return { smoothedHeading: null, lastGoodAt: null, history: [] };
+  return { smoothedHeading: null, lastGoodAt: null, source: 'unknown', compassSmoothed: null, history: [] };
 }
 
 export function normalizeDegrees(deg: number): number {
@@ -68,15 +72,27 @@ export function circularEma(prevDeg: number | null, nextDeg: number, alpha = EMA
 
 /**
  * Updates the own-heading tracker:
- * - Accepts GPS course only when speed >= 3 m/s and accuracy <= 35 m.
- * - Smooths with circular EMA.
- * - Holds last good heading for up to 10 s when speed is lower or accuracy is poor, then marks unknown (null).
+ * - Prefers GPS course when speed >= 3 m/s and accuracy <= 35 m (source = 'gps').
+ * - Holds last good GPS heading for up to 10 s when speed is lower or accuracy is poor.
+ * - Falls back to smoothed device compass heading (source = 'compass') when GPS course is unavailable.
+ * - Otherwise marks heading unknown (null, source = 'unknown').
  */
 export function updateHeadingTracker(
   state: HeadingTrackerState,
-  input: { speedMps: number | null; headingDeg: number | null; accuracyMeters: number | null; now: number }
-): { state: HeadingTrackerState; effectiveHeading: number | null; yawRateDegPerSec: number } {
-  const { speedMps, headingDeg, accuracyMeters, now } = input;
+  input: {
+    speedMps: number | null;
+    headingDeg: number | null;
+    accuracyMeters: number | null;
+    compassHeadingDeg?: number | null;
+    now: number;
+  }
+): {
+  state: HeadingTrackerState;
+  effectiveHeading: number | null;
+  source: HeadingSource;
+  yawRateDegPerSec: number;
+} {
+  const { speedMps, headingDeg, accuracyMeters, compassHeadingDeg = null, now } = input;
   const goodCourse =
     speedMps !== null &&
     Number.isFinite(speedMps) &&
@@ -87,24 +103,55 @@ export function updateHeadingTracker(
     Number.isFinite(accuracyMeters) &&
     accuracyMeters <= MAX_HEADING_ACCURACY_METERS;
 
+  let nextCompass = state.compassSmoothed;
+  if (compassHeadingDeg !== null && Number.isFinite(compassHeadingDeg)) {
+    nextCompass = circularEma(state.compassSmoothed, compassHeadingDeg, 0.25);
+  }
+
   let nextState: HeadingTrackerState;
   if (goodCourse) {
     const smoothed = circularEma(state.smoothedHeading, headingDeg);
     const cutoff = now - YAW_WINDOW_MS;
     const pruned = state.history.filter(h => h.timestamp >= cutoff);
     const history = [...pruned, { headingDeg: smoothed, timestamp: now }].slice(-30);
-    nextState = { smoothedHeading: smoothed, lastGoodAt: now, history };
+    nextState = {
+      smoothedHeading: smoothed,
+      lastGoodAt: now,
+      source: 'gps',
+      compassSmoothed: nextCompass,
+      history,
+    };
   } else {
     const stillValid = state.lastGoodAt !== null && now - state.lastGoodAt <= HEADING_HOLD_MS;
-    nextState = {
-      smoothedHeading: stillValid ? state.smoothedHeading : null,
-      lastGoodAt: stillValid ? state.lastGoodAt : null,
-      history: stillValid ? state.history.filter(h => h.timestamp >= now - YAW_WINDOW_MS) : [],
-    };
+    if (stillValid && state.smoothedHeading !== null) {
+      nextState = {
+        smoothedHeading: state.smoothedHeading,
+        lastGoodAt: state.lastGoodAt,
+        source: 'gps',
+        compassSmoothed: nextCompass,
+        history: state.history.filter(h => h.timestamp >= now - YAW_WINDOW_MS),
+      };
+    } else if (nextCompass !== null) {
+      nextState = {
+        smoothedHeading: nextCompass,
+        lastGoodAt: null,
+        source: 'compass',
+        compassSmoothed: nextCompass,
+        history: [],
+      };
+    } else {
+      nextState = {
+        smoothedHeading: null,
+        lastGoodAt: null,
+        source: 'unknown',
+        compassSmoothed: null,
+        history: [],
+      };
+    }
   }
 
   let yawRateDegPerSec = 0;
-  if (nextState.history.length >= 2) {
+  if (nextState.source === 'gps' && nextState.history.length >= 2) {
     const first = nextState.history[0];
     const last = nextState.history[nextState.history.length - 1];
     const dtSec = (last.timestamp - first.timestamp) / 1000;
@@ -117,6 +164,7 @@ export function updateHeadingTracker(
   return {
     state: nextState,
     effectiveHeading: nextState.smoothedHeading,
+    source: nextState.source,
     yawRateDegPerSec,
   };
 }
@@ -194,14 +242,15 @@ export function projectVehicleToRoad(
       : Infinity;
 
   const absLateral = Math.abs(lateralMeters);
+  const absForward = Math.abs(forwardMeters);
   const laneThreshold = combinedUncertainty + 1.5 * LANE_WIDTH_METERS;
 
   let laneOffset = 0;
   let lateralKnown = false;
   let hasUncertaintyHalo = false;
 
-  if (absLateral <= combinedUncertainty) {
-    // Uncertainty exceeds |lateral| -> treat lateral as unknown, center in own lane with halo
+  if (absForward <= combinedUncertainty || absLateral <= combinedUncertainty) {
+    // Forward or lateral offset is within combined GPS uncertainty -> center in own lane with uncertainty halo
     laneOffset = 0;
     lateralKnown = false;
     hasUncertaintyHalo = true;

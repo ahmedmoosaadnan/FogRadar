@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router } from 'expo-router';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
+import * as Location from 'expo-location';
 import {
   RoadRadarView,
   ProximityLegend,
@@ -15,9 +16,13 @@ import { C } from '../../src/theme/colors';
 import {
   createHeadingTrackerState,
   updateHeadingTracker,
+  type HeadingSource,
 } from '../../src/utils/roadGeometry';
 
+const TAB_BAR_HEIGHT = 66;
+
 export default function Radar() {
+  const insets = useSafeAreaInsets();
   const { gpsState, location, startedAt, refreshLocation } = useJourney();
   const {
     status,
@@ -33,16 +38,50 @@ export default function Radar() {
   const [clock, setClock] = useState(Date.now());
   const [showAdvanced, setShowAdvanced] = useState(false);
 
+  const compassRef = useRef<number | null>(null);
   const trackerRef = useRef(createHeadingTrackerState());
   const [headingState, setHeadingState] = useState<{
     effectiveHeading: number | null;
+    source: HeadingSource;
     yawRateDegPerSec: number;
-  }>({ effectiveHeading: null, yawRateDegPerSec: 0 });
+  }>({ effectiveHeading: null, source: 'unknown', yawRateDegPerSec: 0 });
 
   useEffect(() => {
     const timer = setInterval(() => setClock(Date.now()), 500);
     return () => clearInterval(timer);
   }, []);
+
+  // Native-only device compass fallback via expo-location watchHeadingAsync
+  useEffect(() => {
+    if (Platform.OS === 'web' || gpsState !== 'tracking') {
+      compassRef.current = null;
+      return;
+    }
+    let active = true;
+    let sub: Location.LocationSubscription | null = null;
+    void Location.watchHeadingAsync(h => {
+      if (!active) return;
+      const heading =
+        Number.isFinite(h.trueHeading) && h.trueHeading >= 0
+          ? h.trueHeading
+          : Number.isFinite(h.magHeading) && h.magHeading >= 0
+            ? h.magHeading
+            : null;
+      compassRef.current = heading;
+    })
+      .then(subscription => {
+        if (!active) subscription.remove();
+        else sub = subscription;
+      })
+      .catch(() => {
+        compassRef.current = null;
+      });
+    return () => {
+      active = false;
+      sub?.remove();
+      compassRef.current = null;
+    };
+  }, [gpsState]);
 
   const fixAge = location ? Math.max(0, clock - location.timestamp) : null;
   const freshFix = gpsState === 'tracking' && location !== null && fixAge !== null && fixAge <= 15000;
@@ -53,16 +92,19 @@ export default function Radar() {
   const ownAccuracy = freshFix ? location?.accuracyMeters ?? null : null;
 
   useEffect(() => {
+    const compassHeadingDeg = Platform.OS === 'web' ? null : compassRef.current;
     if (!freshFix || !location) {
       const res = updateHeadingTracker(trackerRef.current, {
         speedMps: null,
         headingDeg: null,
         accuracyMeters: null,
+        compassHeadingDeg,
         now: Date.now(),
       });
       trackerRef.current = res.state;
       setHeadingState({
         effectiveHeading: res.effectiveHeading,
+        source: res.source,
         yawRateDegPerSec: res.yawRateDegPerSec,
       });
       return;
@@ -72,23 +114,47 @@ export default function Radar() {
       speedMps: location.speedKmh !== null ? location.speedKmh / 3.6 : null,
       headingDeg: location.heading,
       accuracyMeters: location.accuracyMeters,
+      compassHeadingDeg,
       now: Date.now(),
     });
     trackerRef.current = res.state;
     setHeadingState({
       effectiveHeading: res.effectiveHeading,
+      source: res.source,
       yawRateDegPerSec: res.yawRateDegPerSec,
     });
   }, [freshFix, location, clock]);
 
+  const statusLabel = freshFeed
+    ? '● LIVE · Cloud connected'
+    : status === 'not-configured'
+      ? '● Server URL missing'
+      : !startedAt
+        ? '● Journey not started'
+        : status === 'connecting'
+          ? '● Connecting to cloud…'
+          : status === 'online'
+            ? '● Waiting for fresh GPS'
+            : '● Cloud offline';
+
+  const headingChipLabel =
+    headingState.source === 'gps'
+      ? 'Heading: GPS'
+      : headingState.source === 'compass'
+        ? 'Heading: Compass'
+        : 'Heading: Unknown';
+
   return (
     <SafeAreaView style={s.safe} edges={['top']}>
       <StatusBar style="light" />
-      <ScrollView contentContainerStyle={s.body}>
+      <ScrollView
+        contentContainerStyle={[s.body, { paddingBottom: TAB_BAR_HEIGHT + insets.bottom + 24 }]}
+        showsVerticalScrollIndicator={false}
+      >
         <View style={s.header}>
           <View>
             <Text style={s.title}>Live Radar</Text>
-            <Text style={s.sub}>Tesla-style Road View · 1 km</Text>
+            <Text style={s.sub}>Top-Down Road View · 1 km</Text>
           </View>
           <View style={s.range}>
             <Text style={s.rangeText}>1.0 km</Text>
@@ -96,32 +162,51 @@ export default function Radar() {
           </View>
         </View>
 
-        <Pressable
-          onPress={() => router.push('/server-connection')}
-          style={[s.banner, { backgroundColor: freshFeed ? '#C2F7D4' : C.gold }]}
-        >
-          <Text style={s.bannerText}>
-            {freshFeed
-              ? '● LIVE GPS + CLOUD'
-              : '● ' +
-                (status === 'not-configured'
-                  ? 'SERVER URL MISSING'
-                  : !startedAt
-                    ? 'START JOURNEY'
-                    : status === 'online'
-                      ? 'WAITING FOR FRESH GPS'
-                      : status.toUpperCase())}{' '}
-            · SETUP ›
-          </Text>
-        </Pressable>
+        <View style={s.chipRow}>
+          <Pressable
+            onPress={() => router.push('/server-connection')}
+            style={[s.banner, { backgroundColor: freshFeed ? '#064E3B' : '#451A03', borderColor: freshFeed ? '#10B981' : '#F59E0B' }]}
+          >
+            <Text style={[s.bannerText, { color: freshFeed ? '#A7F3D0' : '#FDE68A' }]}>{statusLabel}</Text>
+          </Pressable>
+          <View
+            style={[
+              s.headingChip,
+              {
+                borderColor:
+                  headingState.source === 'gps'
+                    ? '#10B981'
+                    : headingState.source === 'compass'
+                      ? '#F59E0B'
+                      : '#475569',
+              },
+            ]}
+          >
+            <Text
+              style={[
+                s.headingChipText,
+                {
+                  color:
+                    headingState.source === 'gps'
+                      ? '#6EE7B7'
+                      : headingState.source === 'compass'
+                        ? '#FDE68A'
+                        : '#94A3B8',
+                },
+              ]}
+            >
+              {headingChipLabel}
+            </Text>
+          </View>
+        </View>
 
         {freshFeed && liveHazards.length > 0 ? (
           <View style={s.hazardBanner}>
             <Icon name="alert" color="white" size={22} />
             <View style={{ flex: 1 }}>
-              <Text style={s.hazardHeading}>UNVERIFIED HAZARD REPORT</Text>
+              <Text style={s.hazardHeading}>HAZARD DETECTED AHEAD</Text>
               <Text style={s.hazardLabel}>
-                {liveHazards[0].type} · about {liveHazards[0].distanceMeters} m · FIELD TEST
+                {liveHazards[0].type} · about {liveHazards[0].distanceMeters} m
               </Text>
             </View>
           </View>
@@ -131,6 +216,7 @@ export default function Radar() {
           vehicles={liveVehicles}
           hazards={liveHazards}
           effectiveHeading={headingState.effectiveHeading}
+          headingSource={headingState.source}
           ownAccuracy={ownAccuracy}
           yawRateDegPerSec={headingState.yawRateDegPerSec}
         />
@@ -140,7 +226,7 @@ export default function Radar() {
           <View style={s.dataCard}>
             <Icon name="car" color="#34D399" />
             <Text style={s.dataValue}>{freshFeed ? liveVehicles.length : '—'}</Text>
-            <Text style={s.dataLabel}>Nearby phones</Text>
+            <Text style={s.dataLabel}>Nearby vehicles</Text>
           </View>
           <View style={s.dataCard}>
             <Icon name="radar" color="#34D399" />
@@ -160,12 +246,12 @@ export default function Radar() {
           </View>
         </View>
 
-        {liveVehicles.length > 0 ? (
-          <View style={s.listCard}>
-            <Text style={s.listTitle}>
-              Nearby connected devices ({liveVehicles.length})
-            </Text>
-            {liveVehicles.slice(0, 12).map((v, index) => {
+        <View style={s.listCard}>
+          <Text style={s.listTitle}>
+            Nearby vehicles {freshFeed ? `(${liveVehicles.length})` : ''}
+          </Text>
+          {liveVehicles.length > 0 ? (
+            liveVehicles.slice(0, 12).map((v, index) => {
               const cat = proximityColor(v.distanceMeters, ownAccuracy, v.accuracyMeters);
               const color = {
                 red: '#EF4444',
@@ -176,28 +262,25 @@ export default function Radar() {
               return (
                 <View key={v.id} style={s.row}>
                   <View style={[s.dot, { backgroundColor: color }]} />
-                  <Text style={s.rowName}>Phone {index + 1}</Text>
+                  <Text style={s.rowName}>Vehicle {index + 1}</Text>
                   <Text style={s.rowDistance}>{v.distanceMeters} m</Text>
                   <Text style={s.rowMeta}>
-                    ±{Math.round((ownAccuracy ?? 0) + v.accuracyMeters)} m · {v.speedKmh ?? '—'} km/h
+                    {v.speedKmh ?? '—'} km/h · ±{v.accuracyMeters} m · {(v.ageMs / 1000).toFixed(1)}s
                   </Text>
                 </View>
               );
-            })}
-          </View>
-        ) : (
-          <Text style={s.subnote}>
-            {freshFeed
-              ? 'No other connected phones within 1 km on this test route.'
-              : 'No validated live radar feed. Open Server Connection / GPS Diagnostics.'}
-          </Text>
-        )}
+            })
+          ) : (
+            <Text style={s.emptyListText}>
+              {freshFeed
+                ? 'No other FogRadar vehicles within 1 km'
+                : 'Waiting for live GPS and cloud connection.'}
+            </Text>
+          )}
+        </View>
 
         {/* Collapsible Advanced diagnostics (collapsed by default) */}
-        <Pressable
-          onPress={() => setShowAdvanced(v => !v)}
-          style={s.advancedToggle}
-        >
+        <Pressable onPress={() => setShowAdvanced(v => !v)} style={s.advancedToggle}>
           <Text style={s.advancedToggleText}>
             {showAdvanced ? '▾ Hide Advanced Diagnostics' : '▸ Advanced Diagnostics'}
           </Text>
@@ -229,7 +312,7 @@ export default function Radar() {
         ) : null}
 
         <Text style={s.disclaimer}>
-          Distance is between GPS estimates, NOT vehicle bumpers. GPS error, direction, and lanes are unresolved. Color means rough proximity only; not safe/unsafe guidance. Connected phones only. Do not depend on this field-test system while driving.
+          Distance is between GPS estimates. Unconnected vehicles are not visible. Color indicates proximity zone only.
         </Text>
       </ScrollView>
     </SafeAreaView>
@@ -238,15 +321,18 @@ export default function Radar() {
 
 const s = StyleSheet.create({
   safe: { flex: 1, backgroundColor: '#060B10' },
-  body: { padding: 14, paddingBottom: 38 },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  body: { padding: 14 },
+  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
   title: { color: '#FFFFFF', fontWeight: '900', fontSize: 26 },
   sub: { color: '#94A3B8', fontSize: 12, marginTop: 3 },
   range: { alignItems: 'flex-end' },
   rangeText: { fontWeight: '900', color: '#34D399', fontSize: 18 },
   rangeSub: { fontSize: 9, color: '#94A3B8', letterSpacing: 1 },
-  banner: { padding: 10, borderRadius: 25, alignItems: 'center', alignSelf: 'center', marginBottom: 12 },
-  bannerText: { fontSize: 10, color: '#19472B', fontWeight: '900', letterSpacing: 0.3 },
+  chipRow: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center', gap: 8, marginBottom: 12 },
+  banner: { paddingHorizontal: 12, paddingVertical: 7, borderRadius: 20, borderWidth: 1 },
+  bannerText: { fontSize: 11, fontWeight: '800', letterSpacing: 0.2 },
+  headingChip: { paddingHorizontal: 10, paddingVertical: 7, borderRadius: 20, backgroundColor: '#0D1722', borderWidth: 1 },
+  headingChipText: { fontSize: 11, fontWeight: '800' },
   hazardBanner: {
     backgroundColor: '#991B1B',
     borderRadius: 14,
@@ -258,7 +344,7 @@ const s = StyleSheet.create({
   },
   hazardHeading: { fontSize: 13, fontWeight: '900', color: '#FFFFFF' },
   hazardLabel: { fontSize: 11, color: '#FEE2E2', marginTop: 3 },
-  cardRow: { flexDirection: 'row', gap: 8, marginTop: 15 },
+  cardRow: { flexDirection: 'row', gap: 8, marginTop: 14 },
   dataCard: {
     flex: 1,
     backgroundColor: '#0D1722',
@@ -271,18 +357,18 @@ const s = StyleSheet.create({
   },
   dataValue: { color: '#FFFFFF', fontSize: 15, fontWeight: '900' },
   dataLabel: { color: '#94A3B8', fontSize: 10, textAlign: 'center' },
-  disclaimer: { color: '#64748B', fontSize: 11.5, lineHeight: 18, textAlign: 'center', marginTop: 20 },
-  subnote: { textAlign: 'center', color: '#CBD5E1', fontSize: 12, marginTop: 14 },
+  disclaimer: { color: '#64748B', fontSize: 11, lineHeight: 17, textAlign: 'center', marginTop: 16 },
   error: { color: '#FCA5A5', fontSize: 12, textAlign: 'center', marginTop: 12 },
   listCard: {
     backgroundColor: '#0D1722',
     borderColor: '#1E293B',
     borderWidth: 1,
     borderRadius: 14,
-    padding: 13,
-    marginTop: 12,
+    padding: 14,
+    marginTop: 14,
   },
-  listTitle: { fontWeight: '800', color: '#FFFFFF', fontSize: 13, marginBottom: 5 },
+  listTitle: { fontWeight: '800', color: '#FFFFFF', fontSize: 13, marginBottom: 6 },
+  emptyListText: { color: '#94A3B8', fontSize: 12, paddingVertical: 6 },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -292,7 +378,7 @@ const s = StyleSheet.create({
     borderColor: '#1E293B',
   },
   dot: { width: 11, height: 11, borderRadius: 6 },
-  rowName: { fontSize: 13, color: '#FFFFFF', fontWeight: '800', minWidth: 64 },
+  rowName: { fontSize: 13, color: '#FFFFFF', fontWeight: '800', minWidth: 74 },
   rowDistance: { fontSize: 15, color: '#FFFFFF', fontWeight: '900' },
   rowMeta: { flex: 1, fontSize: 11, color: '#94A3B8', textAlign: 'right' },
   advancedToggle: {
