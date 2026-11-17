@@ -205,9 +205,9 @@ export default function Radar() {
           <View style={s.hazardBanner}>
             <Icon name="alert" color="white" size={22} />
             <View style={{ flex: 1 }}>
-              <Text style={s.hazardHeading}>HAZARD DETECTED AHEAD</Text>
+              <Text style={s.hazardHeading}>HAZARD AHEAD · {formatVehicleDistance(liveHazards[0].distanceMeters)}</Text>
               <Text style={s.hazardLabel}>
-                {liveHazards[0].type} · about {liveHazards[0].distanceMeters} m
+                {liveHazards[0].type} · {liveHazards[0].reportCount} confirming vehicles
               </Text>
             </View>
           </View>
@@ -219,23 +219,23 @@ export default function Radar() {
           effectiveHeading={headingState.effectiveHeading}
           headingSource={headingState.source}
           ownAccuracy={ownAccuracy}
+          ownSpeedKmh={freshFix ? location?.speedKmh ?? null : null}
           yawRateDegPerSec={headingState.yawRateDegPerSec}
           showOncoming={showOncoming}
         />
         <ProximityLegend />
 
         <View style={s.cardRow}>
+          <View style={[s.dataCard, s.speedHudCard]}>
+            <Text style={s.speedHudValue}>
+              {freshFix && location?.speedKmh != null ? location.speedKmh : '—'}
+            </Text>
+            <Text style={s.speedHudUnit}>km/h · OWN SPEED</Text>
+          </View>
           <View style={s.dataCard}>
             <Icon name="car" color="#34D399" />
             <Text style={s.dataValue}>{freshFeed ? liveVehicles.length : '—'}</Text>
-            <Text style={s.dataLabel}>Nearby vehicles</Text>
-          </View>
-          <View style={s.dataCard}>
-            <Icon name="radar" color="#34D399" />
-            <Text style={s.dataValue}>
-              {freshFix && location?.speedKmh != null ? location.speedKmh : '—'} km/h
-            </Text>
-            <Text style={s.dataLabel}>Real GPS speed</Text>
+            <Text style={s.dataLabel}>Vehicles in range</Text>
           </View>
           <View style={s.dataCard}>
             <Icon name="road" color="#34D399" />
@@ -244,7 +244,7 @@ export default function Radar() {
                 ? `${Math.round(headingState.effectiveHeading)}°`
                 : 'Unknown'}
             </Text>
-            <Text style={s.dataLabel}>Travel heading</Text>
+            <Text style={s.dataLabel}>Heading</Text>
           </View>
         </View>
 
@@ -357,8 +357,11 @@ const s = StyleSheet.create({
     alignItems: 'center',
     gap: 6,
   },
-  dataValue: { color: '#FFFFFF', fontSize: 15, fontWeight: '900' },
+  dataValue: { color: '#FFFFFF', fontSize: 16, fontWeight: '900' },
   dataLabel: { color: '#94A3B8', fontSize: 10, textAlign: 'center' },
+  speedHudCard: { justifyContent: 'center', borderColor: '#10B981', backgroundColor: '#091922' },
+  speedHudValue: { color: '#FFFFFF', fontSize: 28, fontWeight: '900', letterSpacing: -1 },
+  speedHudUnit: { color: '#6EE7B7', fontSize: 9, fontWeight: '800', letterSpacing: 0.4 },
   disclaimer: { color: '#64748B', fontSize: 11, lineHeight: 17, textAlign: 'center', marginTop: 16 },
   error: { color: '#FCA5A5', fontSize: 12, textAlign: 'center', marginTop: 12 },
   listCard: {
