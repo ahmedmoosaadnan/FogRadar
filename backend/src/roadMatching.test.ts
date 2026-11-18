@@ -8,35 +8,89 @@ import {
   type MotorwaySegmentRecord,
 } from './roadMatching.js';
 
-// Synthetic straight North-bound segment along lon=74.3000 from lat=31.5000 to 31.5200 (~2.22 km)
-const SEGMENT: MotorwaySegmentRecord = {
+// Synthetic two-carriageway fixture with a crossover (within 10m), a gap, and a sliver
+const DIR_A_CHAIN_1: MotorwaySegmentRecord = {
   id: 1,
   route: 'M-2 Motorway',
-  direction: 'carriageway-1',
+  direction: 'dir-a',
+  kind: 'main',
   coords: [
     [74.3, 31.5],
     [74.3, 31.51],
-    [74.3, 31.52],
   ],
-  lengthMeters: 2224,
+  lengthMeters: 1112,
 };
 
-test('snapFixToSegments matches within 60m and rejects >60m or poor accuracy', () => {
-  // ~10m East of segment
-  const near = snapFixToSegments(31.505, 74.3001, 10, [SEGMENT], 60);
-  assert.equal(near.matched, true);
-  if (near.matched) {
-    assert.equal(near.route, 'M-2 Motorway');
-    assert.ok(near.offsetMeters < 15);
-    assert.ok(near.chainageMeters > 500 && near.chainageMeters < 600);
+// Opposite carriageway ~10m East at lat=31.505 (within 15m crossover ambiguity zone)
+const DIR_B_CHAIN_1: MotorwaySegmentRecord = {
+  id: 2,
+  route: 'M-2 Motorway',
+  direction: 'dir-b',
+  kind: 'main',
+  coords: [
+    [74.3001, 31.51],
+    [74.3001, 31.5],
+  ],
+  lengthMeters: 1112,
+};
+
+// Second chain of dir-a after a ~220m gap
+const DIR_A_CHAIN_2: MotorwaySegmentRecord = {
+  id: 3,
+  route: 'M-2 Motorway',
+  direction: 'dir-a',
+  kind: 'main',
+  coords: [
+    [74.3, 31.512],
+    [74.3, 31.522],
+  ],
+  lengthMeters: 1112,
+};
+
+const SLIVER: MotorwaySegmentRecord = {
+  id: 4,
+  route: 'M-2 Motorway',
+  direction: 'sliver',
+  kind: 'ramp-or-sliver',
+  coords: [
+    [74.3, 31.505],
+    [74.3005, 31.5055],
+  ],
+  lengthMeters: 75,
+};
+
+const FIXTURE = [DIR_A_CHAIN_1, DIR_B_CHAIN_1, DIR_A_CHAIN_2, SLIVER];
+
+test('heading-aware snapping disambiguates opposite carriageways and excludes slivers', () => {
+  // Moving North (0 deg, 10 m/s) near crossover -> snaps to dir-a
+  const northSnap = snapFixToSegments(31.505, 74.30005, 8, FIXTURE, 60, 0, 10);
+  assert.equal(northSnap.matched, true);
+  if (northSnap.matched) {
+    assert.equal(northSnap.segmentId, 1);
+    assert.equal(northSnap.direction, 'dir-a');
   }
 
-  // ~190m East of segment -> unmatched
-  const far = snapFixToSegments(31.505, 74.302, 10, [SEGMENT], 60);
-  assert.equal(far.matched, false);
+  // Moving South (180 deg, 10 m/s) near crossover -> snaps to dir-b
+  const southSnap = snapFixToSegments(31.505, 74.30005, 8, FIXTURE, 60, 180, 10);
+  assert.equal(southSnap.matched, true);
+  if (southSnap.matched) {
+    assert.equal(southSnap.segmentId, 2);
+    assert.equal(southSnap.direction, 'dir-b');
+  }
+
+  // Unknown heading at crossover (opposite carriageways <= 15m apart) -> ambiguous -> unmatched
+  const ambiguous = snapFixToSegments(31.505, 74.30005, 8, FIXTURE, 60, null, null);
+  assert.equal(ambiguous.matched, false);
+  if (!ambiguous.matched) {
+    assert.equal(ambiguous.ambiguous, true);
+  }
+
+  // Sliver is excluded even if closest
+  const sliverOnly = snapFixToSegments(31.5052, 74.3003, 8, [SLIVER], 60, 45, 10);
+  assert.equal(sliverOnly.matched, false);
 
   // Poor GPS accuracy (>50m) -> unmatched
-  const poorAcc = snapFixToSegments(31.505, 74.3001, 80, [SEGMENT], 60);
+  const poorAcc = snapFixToSegments(31.505, 74.3, 80, FIXTURE, 60, 0, 10);
   assert.equal(poorAcc.matched, false);
 });
 
@@ -44,44 +98,44 @@ test('detectDirectionWithHysteresis classifies forward/backward and holds within
   let dir = detectDirectionWithHysteresis('unknown', 500, 520, 8);
   assert.equal(dir, 'forward');
 
-  // Small 3m jitter backward -> stays forward
   dir = detectDirectionWithHysteresis(dir, 520, 517, 8);
   assert.equal(dir, 'forward');
 
-  // Clear -15m move -> flips to backward
   dir = detectDirectionWithHysteresis(dir, 517, 502, 8);
   assert.equal(dir, 'backward');
 });
 
-test('computePairwiseRoadDistance uses chainage for matched same-segment vehicles and falls back to Haversine', () => {
-  const sameDir = computePairwiseRoadDistance(
-    { latitude: 31.505, longitude: 74.3, matched: true, segmentId: 1, chainageMeters: 500, roadDirection: 'forward' },
-    { latitude: 31.507, longitude: 74.3, matched: true, segmentId: 1, chainageMeters: 720, roadDirection: 'forward' }
+test('computePairwiseRoadDistance uses chainage on same chain, marks opposite dir oncoming, and falls back across gaps', () => {
+  // Same chain & same direction -> chainage distance
+  const sameChain = computePairwiseRoadDistance(
+    { latitude: 31.503, longitude: 74.3, route: 'M-2 Motorway', matched: true, segmentId: 1, chainageMeters: 333, roadDirection: 'dir-a' },
+    { latitude: 31.507, longitude: 74.3, route: 'M-2 Motorway', matched: true, segmentId: 1, chainageMeters: 777, roadDirection: 'dir-a' }
   );
-  assert.equal(sameDir.usedRoadDistance, true);
-  assert.equal(sameDir.distanceMeters, 220);
-  assert.equal(sameDir.aheadMeters, 220);
-  assert.equal(sameDir.oncoming, false);
+  assert.equal(sameChain.usedRoadDistance, true);
+  assert.equal(sameChain.distanceMeters, 444);
+  assert.equal(sameChain.aheadMeters, 444);
+  assert.equal(sameChain.oncoming, false);
 
+  // Opposite direction chains on same route -> oncoming
   const oppDir = computePairwiseRoadDistance(
-    { latitude: 31.505, longitude: 74.3, matched: true, segmentId: 1, chainageMeters: 500, roadDirection: 'forward' },
-    { latitude: 31.507, longitude: 74.3, matched: true, segmentId: 1, chainageMeters: 720, roadDirection: 'backward' }
+    { latitude: 31.503, longitude: 74.3, route: 'M-2 Motorway', matched: true, segmentId: 1, chainageMeters: 333, roadDirection: 'dir-a' },
+    { latitude: 31.507, longitude: 74.3001, route: 'M-2 Motorway', matched: true, segmentId: 2, chainageMeters: 333, roadDirection: 'dir-b' }
   );
   assert.equal(oppDir.oncoming, true);
 
-  const unmatched = computePairwiseRoadDistance(
-    { latitude: 31.505, longitude: 74.3, matched: false },
-    { latitude: 31.506, longitude: 74.3, matched: false }
+  // Across a gap (dir-a chain 1 vs dir-a chain 2) -> falls back to Haversine
+  const acrossGap = computePairwiseRoadDistance(
+    { latitude: 31.509, longitude: 74.3, route: 'M-2 Motorway', matched: true, segmentId: 1, chainageMeters: 1000, roadDirection: 'dir-a' },
+    { latitude: 31.513, longitude: 74.3, route: 'M-2 Motorway', matched: true, segmentId: 3, chainageMeters: 111, roadDirection: 'dir-a' }
   );
-  assert.equal(unmatched.usedRoadDistance, false);
-  assert.ok(unmatched.distanceMeters > 100 && unmatched.distanceMeters < 120);
+  assert.equal(acrossGap.usedRoadDistance, false);
+  assert.ok(acrossGap.distanceMeters > 400 && acrossGap.distanceMeters < 480);
 });
 
 test('extractUpcomingRoadShape returns forward local coordinates for 1 km', () => {
-  const shape = extractUpcomingRoadShape(31.505, 74.3, 0, SEGMENT.coords, 555, 'forward', 1000, 200);
+  const shape = extractUpcomingRoadShape(31.501, 74.3, 0, DIR_A_CHAIN_1.coords, 111, 'dir-a', 900, 200);
   assert.ok(shape.length >= 4);
   assert.ok(Math.abs(shape[0].forwardMeters) < 5);
-  assert.ok(shape[shape.length - 1].forwardMeters >= 900);
+  assert.ok(shape[shape.length - 1].forwardMeters >= 750);
   assert.ok(Math.abs(shape[shape.length - 1].lateralMeters) < 2);
 });
-

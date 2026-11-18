@@ -204,18 +204,23 @@ async function matchFixToMotorway(vehicleId:string,fix:Fix,previous:Fix|null,rou
  if(fix.accuracyMeters>50 || !motorwayTableAvailable){
   return {...fix,matched:false,segmentId:null,chainageMeters:null,offsetMeters:null,roadDirection:'unknown'};
  }
+ const speedMps=fix.speedKmh!==null?fix.speedKmh/3.6:null;
+ const resolveDirection=(segDir:string,segId:number,chainage:number):RoadDirection=>{
+  if(segDir==='dir-a'||segDir==='dir-b')return segDir;
+  return detectDirectionWithHysteresis(
+   previous?.roadDirection??'unknown',
+   previous?.segmentId===segId?previous?.chainageMeters??null:null,
+   chainage,
+   8
+  );
+ };
+
  const cachedSegId=vehicleSegmentCache.get(vehicleId);
  if(cachedSegId!==undefined){
   const cachedSeg=segmentCache.get(cachedSegId);
   if(cachedSeg){
-   const localSnap=snapFixToSegments(fix.latitude,fix.longitude,fix.accuracyMeters,[cachedSeg],60);
+   const localSnap=snapFixToSegments(fix.latitude,fix.longitude,fix.accuracyMeters,[cachedSeg],60,fix.heading,speedMps);
    if(localSnap.matched){
-    const dir=detectDirectionWithHysteresis(
-     previous?.roadDirection??'unknown',
-     previous?.segmentId===cachedSeg.id?previous?.chainageMeters??null:null,
-     localSnap.chainageMeters,
-     8
-    );
     return {
      ...fix,
      route:routeOverride?fix.route:localSnap.route,
@@ -223,7 +228,7 @@ async function matchFixToMotorway(vehicleId:string,fix:Fix,previous:Fix|null,rou
      segmentId:cachedSeg.id,
      chainageMeters:localSnap.chainageMeters,
      offsetMeters:localSnap.offsetMeters,
-     roadDirection:dir,
+     roadDirection:resolveDirection(localSnap.direction,cachedSeg.id,localSnap.chainageMeters),
     };
    }
   }
@@ -233,44 +238,43 @@ async function matchFixToMotorway(vehicleId:string,fix:Fix,previous:Fix|null,rou
   const res=await pool.query<{id:number;route:string;direction:string;geojson:string;length_m:number}>(
    `SELECT id,route,direction,ST_AsGeoJSON(geometry) AS geojson,length_m
     FROM motorway_segments
-    WHERE ST_DWithin(geometry::geography,ST_SetSRID(ST_MakePoint($1,$2),4326)::geography,60)
+    WHERE kind='main' AND ST_DWithin(geometry::geography,ST_SetSRID(ST_MakePoint($1,$2),4326)::geography,60)
     ORDER BY ST_Distance(geometry::geography,ST_SetSRID(ST_MakePoint($1,$2),4326)::geography)
-    LIMIT 1`,
+    LIMIT 5`,
    [fix.longitude,fix.latitude]
   );
   if(!res.rows.length){
    vehicleSegmentCache.delete(vehicleId);
    return {...fix,matched:false,segmentId:null,chainageMeters:null,offsetMeters:null,roadDirection:'unknown'};
   }
-  const row=res.rows[0];
-  const parsed=JSON.parse(row.geojson) as {coordinates?:Array<[number,number]>};
-  const seg:MotorwaySegmentRecord={
-   id:Number(row.id),
-   route:row.route,
-   direction:row.direction,
-   coords:Array.isArray(parsed.coordinates)?parsed.coordinates:[],
-   lengthMeters:Number(row.length_m),
-  };
-  segmentCache.set(seg.id,seg);
-  vehicleSegmentCache.set(vehicleId,seg.id);
-  const snap=snapFixToSegments(fix.latitude,fix.longitude,fix.accuracyMeters,[seg],60);
+  const candSegs:MotorwaySegmentRecord[]=[];
+  for(const row of res.rows){
+   const parsed=JSON.parse(row.geojson) as {coordinates?:Array<[number,number]>};
+   const seg:MotorwaySegmentRecord={
+    id:Number(row.id),
+    route:row.route,
+    direction:row.direction,
+    kind:'main',
+    coords:Array.isArray(parsed.coordinates)?parsed.coordinates:[],
+    lengthMeters:Number(row.length_m),
+   };
+   segmentCache.set(seg.id,seg);
+   candSegs.push(seg);
+  }
+  const snap=snapFixToSegments(fix.latitude,fix.longitude,fix.accuracyMeters,candSegs,60,fix.heading,speedMps);
   if(!snap.matched){
+   vehicleSegmentCache.delete(vehicleId);
    return {...fix,matched:false,segmentId:null,chainageMeters:null,offsetMeters:null,roadDirection:'unknown'};
   }
-  const dir=detectDirectionWithHysteresis(
-   previous?.roadDirection??'unknown',
-   previous?.segmentId===seg.id?previous?.chainageMeters??null:null,
-   snap.chainageMeters,
-   8
-  );
+  vehicleSegmentCache.set(vehicleId,snap.segmentId);
   return {
    ...fix,
    route:routeOverride?fix.route:snap.route,
    matched:true,
-   segmentId:seg.id,
+   segmentId:snap.segmentId,
    chainageMeters:snap.chainageMeters,
    offsetMeters:snap.offsetMeters,
-   roadDirection:dir,
+   roadDirection:resolveDirection(snap.direction,snap.segmentId,snap.chainageMeters),
   };
  }catch(e:unknown){
   const msg=e instanceof Error?e.message:'';

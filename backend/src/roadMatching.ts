@@ -1,24 +1,31 @@
 import { metersBetween } from './geo.js';
 
-export type RoadDirection = 'forward' | 'backward' | 'unknown';
+export type RoadDirection = 'dir-a' | 'dir-b' | 'forward' | 'backward' | 'unknown';
 
 export type MotorwaySegmentRecord = {
   id: number;
   route: string;
   direction: string;
-  coords: Array<[number, number]>; // [lon, lat]
+  kind?: 'main' | 'ramp-or-sliver';
+  coords: Array<[number, number]>; // [lon, lat] oriented in travel direction
   lengthMeters: number;
+  bearing?: number | null;
 };
 
-export type SnapResult = {
-  matched: true;
-  segmentId: number;
-  route: string;
-  chainageMeters: number;
-  offsetMeters: number;
-} | {
-  matched: false;
-};
+export type SnapResult =
+  | {
+      matched: true;
+      segmentId: number;
+      route: string;
+      direction: string;
+      chainageMeters: number;
+      offsetMeters: number;
+      localBearingDeg: number;
+    }
+  | {
+      matched: false;
+      ambiguous?: boolean;
+    };
 
 export type RoadShapePoint = {
   forwardMeters: number;
@@ -28,7 +35,12 @@ export type RoadShapePoint = {
 const EARTH_R = 6371000;
 const RAD = Math.PI / 180;
 
-function toLocalEnu(originLat: number, originLon: number, targetLon: number, targetLat: number): { e: number; n: number } {
+function toLocalEnu(
+  originLat: number,
+  originLon: number,
+  targetLon: number,
+  targetLat: number
+): { e: number; n: number } {
   const cosLat = Math.cos(originLat * RAD);
   return {
     e: (targetLon - originLon) * RAD * EARTH_R * cosLat,
@@ -36,21 +48,35 @@ function toLocalEnu(originLat: number, originLon: number, targetLon: number, tar
   };
 }
 
+function angleDeltaDeg(a: number, b: number): number {
+  return Math.abs(((a - b + 540) % 360) - 180);
+}
+
 /**
  * Projects a WGS84 point onto a LineString ([lon, lat][]) and returns
- * perpendicular offset (meters) and chainage along the polyline (meters).
+ * perpendicular offset (meters), chainage along the polyline (meters),
+ * local segment bearing (0..360 deg), and snapped WGS84 point.
  */
 export function projectPointToPolyline(
   latitude: number,
   longitude: number,
   coords: Array<[number, number]>
-): { offsetMeters: number; chainageMeters: number } {
+): {
+  offsetMeters: number;
+  chainageMeters: number;
+  localBearingDeg: number;
+  snapLat: number;
+  snapLon: number;
+} {
   if (coords.length < 2) {
-    return { offsetMeters: Infinity, chainageMeters: 0 };
+    return { offsetMeters: Infinity, chainageMeters: 0, localBearingDeg: 0, snapLat: latitude, snapLon: longitude };
   }
 
   let bestDist = Infinity;
   let bestChainage = 0;
+  let bestBearing = 0;
+  let bestSnapLat = latitude;
+  let bestSnapLon = longitude;
   let cumulative = 0;
 
   for (let i = 0; i < coords.length - 1; i++) {
@@ -74,50 +100,118 @@ export function projectPointToPolyline(
     if (dist < bestDist) {
       bestDist = dist;
       bestChainage = cumulative + t * segLen;
+      bestBearing = segLen > 1e-6 ? ((Math.atan2(dx, dy) * 180) / Math.PI + 360) % 360 : 0;
+      bestSnapLon = a[0] + t * (b[0] - a[0]);
+      bestSnapLat = a[1] + t * (b[1] - a[1]);
     }
     cumulative += segLen;
   }
 
-  return { offsetMeters: bestDist, chainageMeters: bestChainage };
+  return {
+    offsetMeters: bestDist,
+    chainageMeters: bestChainage,
+    localBearingDeg: bestBearing,
+    snapLat: bestSnapLat,
+    snapLon: bestSnapLon,
+  };
 }
 
 /**
- * Snaps a fix to a list of candidate motorway segments within maxOffsetMeters (default 60 m).
- * Poor-accuracy fixes (> 50 m) are marked unmatched.
+ * Heading-aware snapping to motorway segments within maxOffsetMeters (default 60 m):
+ * - Excludes ramp-or-sliver segments and fixes with poor accuracy (> 50 m).
+ * - When vehicle heading is known and speed >= 3 m/s, prefers candidates whose local bearing
+ *   differs from vehicle heading by < 60 deg.
+ * - When heading is unknown (or cannot disambiguate), if two opposite-direction candidates
+ *   have snap points within ~15 m of each other, marks the match "ambiguous" (unmatched).
  */
 export function snapFixToSegments(
   latitude: number,
   longitude: number,
   accuracyMeters: number,
   segments: MotorwaySegmentRecord[],
-  maxOffsetMeters = 60
+  maxOffsetMeters = 60,
+  vehicleHeadingDeg: number | null = null,
+  vehicleSpeedMps: number | null = null
 ): SnapResult {
   if (!Number.isFinite(accuracyMeters) || accuracyMeters > 50 || !segments.length) {
     return { matched: false };
   }
 
-  let best: SnapResult = { matched: false };
-  let bestOffset = maxOffsetMeters;
+  const candidates: Array<{
+    seg: MotorwaySegmentRecord;
+    offsetMeters: number;
+    chainageMeters: number;
+    localBearingDeg: number;
+    snapLat: number;
+    snapLon: number;
+  }> = [];
 
   for (const seg of segments) {
-    const { offsetMeters, chainageMeters } = projectPointToPolyline(latitude, longitude, seg.coords);
-    if (offsetMeters <= bestOffset) {
-      bestOffset = offsetMeters;
-      best = {
-        matched: true,
-        segmentId: seg.id,
-        route: seg.route,
-        chainageMeters,
-        offsetMeters,
-      };
+    if (seg.kind === 'ramp-or-sliver') continue;
+    const proj = projectPointToPolyline(latitude, longitude, seg.coords);
+    if (proj.offsetMeters <= maxOffsetMeters) {
+      candidates.push({ seg, ...proj });
     }
   }
 
-  return best;
+  if (!candidates.length) {
+    return { matched: false };
+  }
+
+  candidates.sort((a, b) => a.offsetMeters - b.offsetMeters);
+
+  const headingReliable =
+    vehicleHeadingDeg !== null &&
+    Number.isFinite(vehicleHeadingDeg) &&
+    vehicleSpeedMps !== null &&
+    Number.isFinite(vehicleSpeedMps) &&
+    vehicleSpeedMps >= 3;
+
+  if (headingReliable) {
+    const aligned = candidates.filter(c => angleDeltaDeg(c.localBearingDeg, vehicleHeadingDeg) < 60);
+    if (aligned.length > 0) {
+      const best = aligned[0];
+      return {
+        matched: true,
+        segmentId: best.seg.id,
+        route: best.seg.route,
+        direction: best.seg.direction,
+        chainageMeters: best.chainageMeters,
+        offsetMeters: best.offsetMeters,
+        localBearingDeg: best.localBearingDeg,
+      };
+    }
+    return { matched: false };
+  }
+
+  // Heading unknown: check if two opposite-direction candidates are within ~15 m of each other
+  const best = candidates[0];
+  for (let i = 1; i < candidates.length; i++) {
+    const other = candidates[i];
+    if (other.seg.direction !== best.seg.direction) {
+      const sep = metersBetween(
+        { latitude: best.snapLat, longitude: best.snapLon },
+        { latitude: other.snapLat, longitude: other.snapLon }
+      );
+      if (sep <= 15) {
+        return { matched: false, ambiguous: true };
+      }
+    }
+  }
+
+  return {
+    matched: true,
+    segmentId: best.seg.id,
+    route: best.seg.route,
+    direction: best.seg.direction,
+    chainageMeters: best.chainageMeters,
+    offsetMeters: best.offsetMeters,
+    localBearingDeg: best.localBearingDeg,
+  };
 }
 
 /**
- * Detects travel direction along a segment from consecutive chainage changes with hysteresis.
+ * Detects travel direction along an undirected segment from consecutive chainage changes with hysteresis.
  */
 export function detectDirectionWithHysteresis(
   prevDirection: RoadDirection,
@@ -135,25 +229,28 @@ export function detectDirectionWithHysteresis(
 }
 
 /**
- * Computes road distance along chainage when both vehicles are matched to the same segment;
- * otherwise falls back to Haversine straight-line distance.
+ * Computes road distance along chainage when both vehicles are matched to the same directed chain,
+ * detects oncoming vehicles on opposite-direction chains of the same route,
+ * and falls back to Haversine straight-line distance when unmatched or on different chains.
  */
 export function computePairwiseRoadDistance(
   own: {
     latitude: number;
     longitude: number;
+    route?: string;
     matched?: boolean;
     segmentId?: number | null;
     chainageMeters?: number | null;
-    roadDirection?: RoadDirection;
+    roadDirection?: string;
   },
   other: {
     latitude: number;
     longitude: number;
+    route?: string;
     matched?: boolean;
     segmentId?: number | null;
     chainageMeters?: number | null;
-    roadDirection?: RoadDirection;
+    roadDirection?: string;
   }
 ): {
   usedRoadDistance: boolean;
@@ -161,21 +258,31 @@ export function computePairwiseRoadDistance(
   aheadMeters: number | null;
   oncoming: boolean;
 } {
-  if (
-    own.matched &&
-    other.matched &&
-    own.segmentId != null &&
-    own.segmentId === other.segmentId &&
-    own.chainageMeters != null &&
-    other.chainageMeters != null
-  ) {
-    const chainageDiff = other.chainageMeters - own.chainageMeters;
-    const distanceMeters = Math.abs(chainageDiff);
+  if (own.matched && other.matched && own.route && own.route === other.route) {
     const ownDir = own.roadDirection ?? 'unknown';
     const otherDir = other.roadDirection ?? 'unknown';
-    const oncoming = ownDir !== 'unknown' && otherDir !== 'unknown' && ownDir !== otherDir;
-    const aheadMeters = ownDir === 'backward' ? -chainageDiff : chainageDiff;
-    return { usedRoadDistance: true, distanceMeters, aheadMeters, oncoming };
+
+    if (
+      own.segmentId != null &&
+      own.segmentId === other.segmentId &&
+      own.chainageMeters != null &&
+      other.chainageMeters != null &&
+      ownDir === otherDir
+    ) {
+      const chainageDiff = other.chainageMeters - own.chainageMeters;
+      const distanceMeters = Math.abs(chainageDiff);
+      const aheadMeters = ownDir === 'backward' ? -chainageDiff : chainageDiff;
+      return { usedRoadDistance: true, distanceMeters, aheadMeters, oncoming: false };
+    }
+
+    if (ownDir !== 'unknown' && otherDir !== 'unknown' && ownDir !== otherDir) {
+      return {
+        usedRoadDistance: false,
+        distanceMeters: metersBetween(own, other),
+        aheadMeters: null,
+        oncoming: true,
+      };
+    }
   }
 
   return {
@@ -212,7 +319,7 @@ function interpolatePolylineAtChainage(
 }
 
 /**
- * Extracts the next ~1 km of the matched segment ahead of the vehicle in local (forward, lateral) meters.
+ * Extracts the next ~1 km of the matched directed chain ahead of the vehicle in local (forward, lateral) meters.
  */
 export function extractUpcomingRoadShape(
   ownLat: number,
@@ -220,7 +327,7 @@ export function extractUpcomingRoadShape(
   ownHeadingDeg: number | null,
   coords: Array<[number, number]>,
   chainageMeters: number,
-  direction: RoadDirection,
+  direction: string,
   maxRangeMeters = 1000,
   stepMeters = 100
 ): RoadShapePoint[] {
@@ -247,4 +354,3 @@ export function extractUpcomingRoadShape(
   }
   return points;
 }
-

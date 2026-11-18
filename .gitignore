@@ -1,5 +1,6 @@
 node_modules/
 .expo/
+scripts/.cache/
 build/
 android/
 ios/
